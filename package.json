@@ -1,0 +1,19 @@
+{
+  "name": "multi-agent",
+  "version": "0.0.1",
+  "description": "自己的多 Agent 调度：一条命令派活，产物自动归档",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "run": "node --disable-warning=ExperimentalWarning src/host/cli.ts run",
+    "status": "node --disable-warning=ExperimentalWarning src/host/cli.ts status",
+    "check": "node --disable-warning=ExperimentalWarning src/host/cli.ts check",
+    "serve": "node --disable-warning=ExperimentalWarning src/host/server.ts",
+    "test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.ts\"",
+    "eval": "node --disable-warning=ExperimentalWarning evals/run.ts",
+    "doctor": "node --disable-warning=ExperimentalWarning src/host/cli.ts doctor"
+  }
+}

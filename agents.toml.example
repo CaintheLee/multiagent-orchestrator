@@ -1,0 +1,46 @@
+# 示例配置。复制成 agents.toml 再按自己的项目改：
+#   copy agents.toml.example agents.toml
+#
+# 最小可用：一个主控 + 一个执行者。多线就继续加 [agent.x] 段。
+# 字段含义见 docs/CURRENT.md；provider 名称见 src/adapters/table.ts。
+
+schema = 1
+
+[protocol]
+max_summary = 200
+max_detail = 4000
+
+[project]
+name = "示例项目"
+root = "D:/YourProject"
+
+[spawn]
+auto_approve = false
+defaults_enabled = false
+role = "executor"
+model = ""
+timeout_min = 30
+access = "write"
+task_prefix = ""
+
+[root]
+id = "a"
+parent = ""
+name = "主控"
+plugin = "codebuddy"
+workspace = "a"
+timeout_min = 20
+access = "write"
+role = "executor"
+model = ""
+
+[agent.b]
+id = "b"
+parent = "a"
+name = "执行者"
+plugin = "codebuddy"
+workspace = "b"
+timeout_min = 30
+access = "write"
+role = "executor"
+model = ""

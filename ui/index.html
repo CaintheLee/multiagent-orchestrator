@@ -153,6 +153,8 @@
   .runbtn.resume{background:#22314d;border:1px solid #35507a;color:#d7e3ff}
   .runbtn.resume:hover{background:#2a3c5e;filter:none}
   .runbtn:disabled{opacity:.5;cursor:default}
+  .tpl-pick{float:right;font-size:11px;padding:2px 6px;border-radius:6px;background:#1a1f2b;
+    border:1px solid #2b3345;color:#b9c4d8;max-width:120px}
   /* 审核：平时压成黑色不抢注意力，有活的时候才发光。
      发光用 box-shadow 脉冲而不是变色——变色在深色底上不够抓眼，脉冲会动 */
   .runbtn.review{background:#0e1116;border:1px solid #262c36;color:#c2cbdb}
@@ -897,7 +899,10 @@
           <span class="mon-t">任务动态</span>
           <span class="muted xs" id="monHint">—</span>
           <div class="spacer"></div>
+          <button type="button" class="ghost sm" id="monRisk" hidden title="这是高风险任务，确认后才会开跑">确认执行</button>
+          <button type="button" class="ghost sm" id="monPause" hidden title="停下当前轮次，已完成的部分保留；之后用「续跑」接着干">暂停</button>
           <button type="button" class="ghost sm" id="monResume" hidden title="把这个没跑完的任务接着跑">续跑</button>
+          <button type="button" class="ghost sm" id="monDelete" title="删除任务记录与归档；产物默认留在 .sandbox">删除</button>
           <button type="button" class="ghost sm" id="monRefresh">刷新</button>
         </div>
         <div class="mon-wait" id="monWait" hidden></div>
@@ -976,9 +981,17 @@
               <input id="mTask" placeholder="留空会自动取详细要求的第一行" />
               <div class="fhint"><span id="mTaskN">0</span>/200 · 可留空，自动取详细要求首行</div>
             </div>
-            <div class="frow"><label for="mTaskDetail">详细要求 <code>≤4000 字</code></label>
+            <div class="frow"><label for="mTaskDetail">详细要求 <code>≤4000 字</code>
+                <select id="mTpl" class="tpl-pick" title="选个模板填进去，再按需改">
+                  <option value="">用模板…</option>
+                  <option value="inventory">资产清点</option>
+                  <option value="readonly">只读梳理</option>
+                  <option value="code">代码修改</option>
+                  <option value="audit">审计复核</option>
+                </select>
+              </label>
               <textarea id="mTaskDetail" rows="5"></textarea>
-              <div class="fhint"><span id="mTaskDetN">0</span>/4000</div>
+              <div class="fhint"><span id="mTaskDetN">0</span>/4000<span id="mTplHint"></span></div>
             </div>
             <div class="row">
               <button type="button" id="mTaskSend">派给 A 主控</button>
@@ -1412,7 +1425,9 @@ function nodeState(id){
 }
 function stateLabel(st){
   return st === 'running' ? '运行中' : st === 'done' ? '已完成' : st === 'failed' ? '失败'
-    : st === 'blocked' ? '等回答' : st === 'queued' ? '排队' : '待命';
+    : st === 'blocked' ? '等回答' : st === 'queued' ? '排队'
+    : st === 'paused' ? '已暂停' : st === 'canceled' ? '已取消'
+    : st === 'interrupted' ? '被打断' : '待命';
 }
 /** 有等你决定的事：最近一轮失败/超时/被打回。
  *  中断（hub 重启杀的）不算——那不是 agent 的问题，重跑就行，别挂个红圈让人以为它在等我。 */
@@ -2032,12 +2047,38 @@ function fillPluginOptions(sel, current){
 /** 续跑按钮常显（有任务就显示），能不能点用文案和禁用态说清楚。
  *  以前是 hidden 控制：不可续时按钮直接消失，人只会觉得「点了没反应/找不到入口」。
  *  顶栏和任务动态栏各有一个，共用这一份状态。 */
+/**
+ * 暂停按钮：只对「正在跑」或「排队中」显示。
+ * 它和续跑是一对：暂停存快照，续跑接着跑——CLI 是一次性进程，没有真挂起。
+ */
+/**
+ * 高风险签核按钮：只在「blocked + risk_hold」时出现。
+ * 这类任务不是卡住，是在等你点头说「可以删/可以移」。
+ */
+function paintRiskBtn(){
+  const b = $('#monRisk');
+  if (!b) return;
+  const hold = !!curTask && curTask.state === 'blocked' && curTask.error_code === 'risk_hold';
+  b.hidden = !hold;
+  b.disabled = !hold;
+  if (hold) b.title = String(curTask.error_message || '高风险任务，确认后开跑').slice(0, 240);
+}
+
+function paintPauseBtn(){
+  const b = $('#monPause');
+  if (!b) return;
+  const st = curTask ? curTask.state : '';
+  const live = st === 'running' || st === 'queued' || st === 'cancelling';
+  b.hidden = !live;
+  b.disabled = !live;
+}
+
 function paintResumeBtn(b, label){
   if (!b) return;
   const name = label || '续跑';
   b.hidden = !curTask;
   if (!curTask) return;
-  const can = ['interrupted', 'failed', 'canceled', 'blocked'].indexOf(curTask.state) >= 0;
+  const can = ['interrupted', 'failed', 'canceled', 'blocked', 'paused'].indexOf(curTask.state) >= 0;
   const alive = ['running', 'queued', 'cancelling'].indexOf(curTask.state) >= 0;
   if (curTask.resumedBy){
     b.disabled = false;
@@ -2057,6 +2098,8 @@ function refreshResumeBtn(){
   paintResumeBtn($('#monResume'), '续跑');
   // 工具栏那个按钮本身就是「断点继续」，文案带上图标
   paintResumeBtn($('#breakResume'), '⟲ 断点继续');
+  paintPauseBtn();
+  paintRiskBtn();
 }
 
 function refreshLaneLine(){
@@ -2222,6 +2265,80 @@ function chatAppend(text, cls){
 }
 
 /** 任务方案卡：对话里生成的方案摊开给人看，点「派发」才真的建任务 */
+/**
+ * 从前端文本里解析「改动计划」块。
+ *
+ * 后端不解析这个块：它只是给人看的授权请求，不参与验收。
+ * 放前端解析的好处是历史回放能直接复用同一段逻辑。
+ */
+function parseEditPlanClient(text){
+  const m = /```ma-edit-plan\s*\n([\s\S]*?)```/.exec(String(text || ''));
+  if (!m) return null;
+  try {
+    const j = JSON.parse(m[1].trim());
+    const files = (Array.isArray(j.files) ? j.files : [])
+      .map((x) => String(x || '').trim())
+      .filter((x) => x && !/[\\/]$/.test(x))
+      .slice(0, 12);
+    if (!files.length) return null;
+    return { files, reason: j.reason ? String(j.reason).slice(0, 200) : '', risk: j.risk ? String(j.risk).slice(0, 20) : '' };
+  } catch { return null; }
+}
+
+/** 改动计划卡：列文件 + 一个「允许修改」按钮 */
+function editPlanCard(plan){
+  const el = document.createElement('div');
+  el.className = 'plan edit-plan';
+
+  const h = document.createElement('div');
+  h.className = 'plan-h';
+  h.textContent = '改动计划' + (plan.risk === 'high' ? ' · 高风险' : '');
+  el.appendChild(h);
+
+  const ul = document.createElement('ul');
+  ul.className = 'plan-steps';
+  for (const f of plan.files){
+    const li = document.createElement('li');
+    li.textContent = f;
+    ul.appendChild(li);
+  }
+  el.appendChild(ul);
+
+  if (plan.reason){
+    const r = document.createElement('div');
+    r.className = 'plan-risk';
+    r.textContent = '理由：' + plan.reason;
+    el.appendChild(r);
+  }
+
+  const acts = document.createElement('div');
+  acts.className = 'plan-acts';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'sm';
+  btn.textContent = '允许修改这 ' + plan.files.length + ' 个文件';
+  btn.onclick = async () => {
+    if (chatBusy){ toast('上一句还没答完', 'warn'); return; }
+    btn.disabled = true;
+    const r = await postJson('/api/chat', {
+      nodeId: chatTarget(),
+      text: '按上面的计划改，只改列出的这些文件；每处改完说清改了什么。',
+      grant: { files: plan.files, reason: plan.reason || '' },
+    });
+    if (!r.ok){
+      toast('发起失败：' + r.error, 'err');
+      btn.disabled = false;
+      return;
+    }
+    toast('已授权，开始改这 ' + plan.files.length + ' 个文件', 'ok');
+    chatBusy = true;
+    paintChatBusy();
+  };
+  acts.appendChild(btn);
+  el.appendChild(acts);
+  return el;
+}
+
 function planCard(plan){
   const el = document.createElement('div');
   el.className = 'plan';
@@ -2398,6 +2515,15 @@ function onChatEvent(ev){
     return;
   }
   if (ev.t === 'done'){
+    // 回答里有改动计划：把原始 JSON 块从气泡里抹掉，换成带按钮的卡
+    if (chatDraft){
+      const txt = chatDraft.textContent || '';
+      const edit = parseEditPlanClient(txt);
+      if (edit){
+        chatDraft.textContent = txt.replace(/```ma-edit-plan[\s\S]*?```/g, '').trim();
+        chatDraft.appendChild(editPlanCard(edit));
+      }
+    }
     chatBusy = false;
     chatDraft = null;
     paintChatBusy();
@@ -2425,8 +2551,15 @@ async function renderChat(force){
     const j = await fetch('/api/chat/history?node=' + encodeURIComponent(id), { cache: 'no-store' }).then((r) => r.json());
     if (body) body.innerHTML = '';
     for (const m of j.messages || []){
-      const el = chatAppend(m.text, m.role === 'user' ? 'u' : 'a');
+      let txt = m.text;
+      let edit = null;
+      if (m.role !== 'user'){
+        edit = parseEditPlanClient(txt);
+        if (edit) txt = String(txt).replace(/```ma-edit-plan[\s\S]*?```/g, '').trim();
+      }
+      const el = chatAppend(txt, m.role === 'user' ? 'u' : 'a');
       if (m.plan) el.appendChild(planCard(m.plan));
+      if (edit) el.appendChild(editPlanCard(edit));
     }
     chatBusy = !!j.busy;
     if (!chatBusy && !(j.messages || []).length){
@@ -2886,6 +3019,32 @@ async function loadAgents(){
   }
 }
 
+/**
+ * 站内通知：轮询发现任务状态变化就弹一条。
+ *
+ * 为什么不做成后端推送：现在每 4 秒本来就要拉一次任务列表，
+ * 顺手比对一下就行，不需要再加一条 SSE 通道。
+ * 首次加载不提示（否则一打开页面就把历史任务全弹一遍）。
+ */
+let LAST_STATES = null;
+function checkStateChanges(tasks){
+  const now = new Map(tasks.map((t) => [t.id, t.state]));
+  if (LAST_STATES){
+    for (const t of tasks){
+      const prev = LAST_STATES.get(t.id);
+      if (!prev || prev === t.state) continue;
+      if (['done','failed','blocked','canceled','paused','interrupted'].indexOf(t.state) < 0) continue;
+      const kind = t.state === 'done' ? 'ok' : t.state === 'failed' ? 'err' : 'warn';
+      toast('#' + t.id + ' ' + stateLabel(t.state) + '：' + String(t.task || '').replace(/\s+/g, ' ').slice(0, 36), kind);
+      // 需要人处理的两种，标题也带上，切到别的标签页也看得到
+      if (t.state === 'blocked' || t.state === 'failed'){
+        document.title = '⚠ #' + t.id + ' ' + stateLabel(t.state) + ' · MultiAgent';
+      }
+    }
+  }
+  LAST_STATES = now;
+}
+
 async function loadTasks(){
   try {
     const s = await fetch('/api/tasks', { cache: 'no-store' }).then((r) => r.json());
@@ -2898,6 +3057,7 @@ async function loadTasks(){
     sel.innerHTML = TASKS.length
       ? TASKS.map((t) => '<option value="' + t.id + '"' + (t.id === curId ? ' selected' : '') + '>#' + t.id + ' ' + esc(t.state) + ' · ' + esc(String(t.task || '').replace(/\s+/g, ' ').slice(0, 26)) + '</option>').join('')
       : '<option value="0">（还没有任务）</option>';
+    checkStateChanges(TASKS);
     renderRunbar();
     if (!curTask && TASKS.length) await pickTask(TASKS[0].id, true);
     return true;
@@ -3597,6 +3757,183 @@ async function doResume(){
 
 $('#resumeBtn').onclick = doResume;
 $('#monResume').onclick = doResume;
+/**
+ * 任务模板：五要素（目标/范围/交付物/验收/硬约束）。
+ *
+ * 为什么放前端常量而不是配置文件：它们是「怎么写清楚一件事」的示范，
+ * 不是运行参数。想改直接改这里，或者选完模板在框里改——模板只是起点。
+ */
+const TASK_TPL = {
+  inventory: [
+    '【目标】',
+    '清点 <范围> 的全部资产，出一份可核对的台账。',
+    '',
+    '【范围】',
+    '只读，不改动任何文件。',
+    '',
+    '【要做什么】',
+    '1. 按磁盘实际情况统计：路径、字节数、格式、状态',
+    '2. 一行一件，写进 CSV',
+    '3. 写清统计口径：哪些算、哪些不算',
+    '',
+    '【交付物】',
+    '- <目录>/inventory_<日期>.csv（列：路径 / 字节数 / 格式 / 状态）',
+    '- <目录>/inventory_<日期>.md（总数、总大小、缺口清单）',
+    '',
+    '【验收】',
+    '- 抽样 30 行去磁盘 stat，字节数必须与登记一致',
+    '- 结论里的总数与总大小要能被 CSV 复算出来',
+    '',
+    '【硬约束】',
+    '- 只读：不移动、不删除、不改名',
+    '- 不确定的标「待确认」，不要猜',
+  ].join('\n'),
+
+  readonly: [
+    '【目标】',
+    '把 <对象> 的现状梳理清楚，给出结论，不改任何文件。',
+    '',
+    '【范围】',
+    '只读。可以读代码、读配置、跑只读命令。',
+    '',
+    '【要做什么】',
+    '1. 先确认现状（版本、目录结构、关键入口）',
+    '2. 按主题分段读，每段给一条可核对的结论',
+    '3. 指出矛盾与缺口，不要下「总体良好」这种结论',
+    '',
+    '【交付物】',
+    '- <目录>/SURVEY_<日期>.md（结论 + 证据 + 待确认项）',
+    '',
+    '【验收】',
+    '- 每条结论都要能指向具体文件或命令输出',
+    '- 不确定的写「证据不足」，并说明还缺什么',
+    '',
+    '【硬约束】',
+    '- 不改文件、不移动、不删除，不跑会改状态的命令',
+  ].join('\n'),
+
+  code: [
+    '【目标】',
+    '改掉 <问题>，行为不变或按说明变化。',
+    '',
+    '【范围】',
+    '只动这些文件：<文件列表>。其他一律不碰。',
+    '',
+    '【要做什么】',
+    '1. 先读相关代码，说清现状与要改的点',
+    '2. 最小改动；改一处跑一次测试',
+    '3. 改完跑全量测试，贴出结果',
+    '',
+    '【交付物】',
+    '- 改动后的源码（不新建无关文件）',
+    '- 一段说明：改了哪几处、为什么、怎么验证的',
+    '',
+    '【验收】',
+    '- 全量测试通过（贴命令与结果）',
+    '- 新增/修改的行为有对应用例',
+    '',
+    '【硬约束】',
+    '- 不改公共接口签名（必须改时先说明影响面）',
+    '- 不批量格式化无关文件',
+    '- 不删除任何文件',
+  ].join('\n'),
+
+  audit: [
+    '【目标】',
+    '复核 <对象>，只判「过 / 不过 / 无法判断」，并给证据。',
+    '',
+    '【范围】',
+    '只读复核。不改被审对象，不「顺手修一下」。',
+    '',
+    '【要做什么】',
+    '1. 随机抽样（写出随机方式），逐项核对',
+    '2. 发现的问题必须带行号/路径与实测值',
+    '3. 结论三档选一个，不许写「基本准确」',
+    '',
+    '【交付物】',
+    '- <目录>/AUDIT_<对象>_<日期>.md（逐项结论 + 问题清单 + 三档结论）',
+    '',
+    '【验收】',
+    '- 每条问题都有定位与实测值',
+    '- 判「过」要能引两段原文作证',
+    '',
+    '【硬约束】',
+    '- 只读。不改、不删、不覆盖被审对象',
+    '- 审不完就如实写「第 X 项未完成」',
+  ].join('\n'),
+};
+
+$('#mTpl').onchange = () => {
+  const key = $('#mTpl').value;
+  const box = $('#mTaskDetail');
+  const hint = $('#mTplHint');
+  if (!key){ if (hint) hint.textContent = ''; return; }
+  const tpl = TASK_TPL[key];
+  if (!tpl) return;
+  if (box.value.trim() && !confirm('详细要求里已经有内容，用模板覆盖？')){
+    $('#mTpl').value = '';
+    return;
+  }
+  box.value = tpl;
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+  box.focus();
+  if (hint) hint.textContent = ' · 已填入模板，按需改「<…>」里的占位';
+  toast('模板已填入，记得改掉尖括号里的占位', 'ok');
+};
+
+$('#monDelete').onclick = async () => {
+  if (!curTask) return;
+  if (['running','queued','cancelling'].indexOf(curTask.state) >= 0){
+    toast('任务还在跑，先停止再删', 'warn');
+    return;
+  }
+  // 二次确认用「输入任务号」而不是一个确定按钮：删数据不可逆，误点代价太大
+  const ans = prompt('删除任务 #' + curTask.id + '？\n\n这会删掉数据库记录、归档清单与诊断。'
+    + '\n.sandbox 里的产物默认保留（可追溯），要连产物一起删请用命令行 DELETE ?purge=1。'
+    + '\n\n输入任务号确认：');
+  if (ans === null) return;
+  if (String(ans).trim() !== String(curTask.id)){
+    toast('输入不一致，已取消', 'warn');
+    return;
+  }
+  const r = await fetch('/api/tasks/' + curTask.id, { method: 'DELETE' }).then((x) => x.json()).catch((e) => ({ ok: false, error: String(e) }));
+  if (!r.ok){ toast('删除失败：' + r.error, 'err'); return; }
+  toast('已删除 #' + curTask.id + '（' + (r.removed || []).join('、') + '）', 'ok');
+  curTask = null;
+  await loadTasks();
+};
+
+$('#monRisk').onclick = async () => {
+  if (!curTask) return;
+  const btn = $('#monRisk');
+  btn.disabled = true;
+  try {
+    const r = await postJson('/api/tasks/' + curTask.id + '/approve-risk', {});
+    if (!r.ok){ toast('确认失败：' + r.error, 'err'); return; }
+    toast('已确认 #' + curTask.id + '，任务重新入队', 'ok');
+    await loadTasks();
+    await pickTask(curTask.id, true);
+  } finally {
+    btn.disabled = false;
+    paintRiskBtn();
+  }
+};
+
+$('#monPause').onclick = async () => {
+  if (!curTask) return;
+  const btn = $('#monPause');
+  btn.disabled = true;
+  try {
+    const r = await postJson('/api/tasks/' + curTask.id + '/pause', {});
+    if (!r.ok){ toast('暂停失败：' + r.error, 'err'); return; }
+    toast('已暂停 #' + curTask.id + '，完成后点「续跑」接着干', 'ok');
+    await loadTasks();
+    await pickTask(curTask.id, true);
+  } finally {
+    btn.disabled = false;
+    paintPauseBtn();
+  }
+};
 $('#breakResume').onclick = doResume;
 
 // 运行中的节点每秒刷新耗时。只改文本，不重建节点：

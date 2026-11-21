@@ -60,3 +60,59 @@ test('provider 名不合法直接拒绝', () => {
 test('没有 providers.toml 时静默跳过', () => {
   assert.deepEqual(registerProvidersFrom(path.join(TMP, 'nope.toml')), []);
 });
+
+// ---- 内置四家的参数形态 ----
+// 这些字符串直接进 argv，改错了整条线就跑不起来。四家各有各的坑：
+// codex 的提示词必须走 stdin（含换行的 argv 会让它静默卡死）；
+// 只有 codex 有真只读；claude / gemini 的参数是照约定写的，没在本机跑过。
+import { providerNames, supportsReadOnly } from '../src/adapters/table.ts';
+
+const base = { prompt: '做点事', cwd: TMP, timeoutMs: 1000, access: 'write' };
+
+test('codex：提示词走 stdin，access 决定 sandbox 档位', () => {
+  const p = PROVIDERS.codex;
+  assert.equal(p.stdin, true, 'argv 里带换行会让 codex 静默卡死');
+  const w = p.args({ ...base, access: 'write' });
+  assert.deepEqual(w.slice(0, 3), ['exec', '--skip-git-repo-check', '--sandbox']);
+  assert.equal(w[3], 'workspace-write');
+  assert.ok(!w.includes(base.prompt), '提示词不能出现在 argv 里');
+  assert.equal(p.args({ ...base, access: 'read' })[3], 'read-only');
+});
+
+test('codebuddy：-p -y + 可选 model + prompt', () => {
+  const p = PROVIDERS.codebuddy;
+  assert.equal(p.stdin, false);
+  assert.deepEqual(p.args({ ...base }), ['-p', '-y', base.prompt]);
+  assert.deepEqual(p.args({ ...base, model: 'x1' }), ['-p', '-y', '--model', 'x1', base.prompt]);
+});
+
+test('claude / gemini：-p + 可选 model + prompt，且不声称只读', () => {
+  for (const name of ['claude', 'gemini']) {
+    const p = PROVIDERS[name];
+    assert.equal(p.stdin, false, name);
+    assert.deepEqual(p.args({ ...base }), ['-p', base.prompt], name);
+    assert.deepEqual(p.args({ ...base, model: 'm' }), ['-p', '--model', 'm', base.prompt], name);
+    assert.notEqual(p.supportsReadOnly, true, name + ' 没验证过只读，不能声称支持');
+    assert.notEqual(p.verified, true, name + ' 没在本机跑过，不能标已实测');
+  }
+});
+
+test('只有 codex 支持真只读', () => {
+  assert.equal(supportsReadOnly('codex'), true);
+  for (const n of ['codebuddy', 'claude', 'gemini']) {
+    assert.equal(supportsReadOnly(n), false, n + ' 的 read 只是装饰');
+  }
+  assert.equal(supportsReadOnly('不存在的'), false);
+});
+
+test('四家都在表里，且有 label 与 bin', () => {
+  for (const n of ['codex', 'codebuddy', 'claude', 'gemini']) {
+    assert.ok(providerNames().includes(n), n + ' 应当在表里');
+    assert.ok(PROVIDERS[n].label, n + ' 缺 label');
+    assert.equal(typeof PROVIDERS[n].bin, 'function', n + ' 缺 bin');
+  }
+});
+
+test('自定义 provider 不声称只读：它可能只是个包装脚本', () => {
+  assert.equal(supportsReadOnly('t_mytool'), false);
+});

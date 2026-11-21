@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Config, NodeConfig } from '../src/kernel/tree.ts';
+import type { Config, Limits, NodeConfig } from '../src/kernel/tree.ts';
 import type { RunOpts } from '../src/adapters/table.ts';
 import type { RunRecord } from '../src/store/runs.ts';
 
@@ -65,7 +65,7 @@ async function run(
   nodes: NodeConfig[],
   task: string,
   runner: Runner,
-  limits?: { concurrency: number; maxTokens: number; maxMinutes: number },
+  limits?: Limits,
 ): Promise<{ rec: RunRecord | null; logs: string[]; taskId: number }> {
   const cfg = cfgOf(nodes);
   const taskId = createTask(DB, { master: cfg.root.id, task, configSnapshot: '{}' });
@@ -559,7 +559,7 @@ test('token 超过上限就熔断，转 blocked 而不是硬跑到底', async ()
   };
 
   const { rec, logs } = await run(nodes, '烧钱的任务', runner, {
-    concurrency: 3, maxTokens: 100, maxMinutes: 0,
+    concurrency: 3, maxTokens: 100, maxMinutes: 0, diagnose: false,
   });
   assert.equal(rec?.state, 'blocked', '超预算应当停下等人：' + logs.join('\n'));
   assert.match(logs.join('\n'), /预算熔断/);
@@ -579,6 +579,6 @@ test('上限设 0 表示不限，不会误伤', async () => {
         : { summary: '收口通过', dispatch: [], evidence: [] },
     );
   };
-  const { rec } = await run(nodes, '不限预算', runner, { concurrency: 3, maxTokens: 0, maxMinutes: 0 });
+  const { rec } = await run(nodes, '不限预算', runner, { concurrency: 3, maxTokens: 0, maxMinutes: 0, diagnose: false });
   assert.equal(rec?.state, 'done');
 });

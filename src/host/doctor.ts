@@ -68,10 +68,19 @@ export async function runDoctor(root = SANDBOX_ROOT, port = 3400): Promise<{ ite
     const plugins = [...new Set(cfg.nodes.map((n) => n.plugin))];
     for (const p of plugins) {
       try {
-        const bin = providerOf(String(p)).bin();
-        add('ok', `provider ${p} → ${bin}`);
+        const prov = providerOf(String(p));
+        const bin = prov.bin();
+        // 把「实测过没有、能不能真只读」摊开：这两项决定了换机器时会不会踩坑
+        const tags: string[] = [];
+        tags.push(prov.verified ? '参数已实测' : '参数未在本机验证');
+        tags.push(prov.supportsReadOnly ? '支持真只读' : '无只读模式');
+        add('ok', `provider ${p} → ${bin}`, tags.join(' · '));
       } catch (e) {
-        add('fail', `provider ${p} 不可用`, firstLine(e));
+        add(
+          'fail',
+          `provider ${p} 不可用`,
+          firstLine(e) + '｜装好后用 MA_' + String(p).toUpperCase() + ' 指定路径，或换掉这个节点的 plugin',
+        );
       }
     }
 

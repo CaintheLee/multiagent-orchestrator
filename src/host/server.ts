@@ -19,6 +19,11 @@ import { inside } from '../kernel/settle.ts';
 import { PROVIDERS, providerNames, registerProvidersFrom, supportsReadOnly } from '../adapters/table.ts';
 import { getModels, peekModels, refreshModels } from '../adapters/models.ts';
 import { listRoles } from '../kernel/roles.ts';
+import { readManifest, removeArchive } from '../kernel/archive.ts';
+import { loadDiagnosis } from '../kernel/diagnose.ts';
+import { handleArtifact } from './routes/artifact.ts';
+import { handleChat, parseGrant, chatFallbackCwd, CHAT_NODE_RE } from './routes/chat.ts';
+import { needsSignoff, riskText } from '../kernel/risk.ts';
 import { CONFIG_FILE, DATA_DIR, PROMPTS_DIR, PROVIDERS_FILE, SANDBOX_ROOT, UI_FILE } from '../kernel/paths.ts';
 import { ConfigError, mutateConfig } from '../kernel/config-lock.ts';
 import {
@@ -45,7 +50,7 @@ const CFG = CONFIG_FILE;
 const CHAT_MAX = 4000;
 /** 对话节点 id 的合法格式。它会被拼进 .data/chat/<id>.jsonl，
  *  必须挡住 `../` 和路径分隔符，否则能删/读聊天目录外的文件（审计 M2） */
-const CHAT_NODE_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
 
 /**
  * 对话用的任务快照。
@@ -234,7 +239,7 @@ const scheduler = new Scheduler({
   },
 });
 
-const TERMINAL = ['done', 'failed', 'canceled', 'timed_out', 'interrupted', 'blocked'];
+const TERMINAL = ['done', 'failed', 'canceled', 'timed_out', 'interrupted', 'blocked', 'paused'];
 
 /** 请求体上限。本地服务也是浏览器可达的地址，不能让它无限读下去 */
 const MAX_BODY = 8 * 1024 * 1024;
@@ -276,21 +281,6 @@ async function waitDone(
   }
 }
 
-const MIME: Record<string, string> = {
-  '.html': 'text/html; charset=utf-8',
-  '.htm': 'text/html; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.gif': 'image/gif',
-  '.mp4': 'video/mp4',
-  '.pdf': 'application/pdf',
-  '.json': 'application/json; charset=utf-8',
-  '.md': 'text/plain; charset=utf-8',
-  '.txt': 'text/plain; charset=utf-8',
-};
 
 function json(res: http.ServerResponse, code: number, body: unknown): void {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -428,42 +418,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   if (p === '/api/artifact') {
-    const target = url.searchParams.get('path') || '';
-    const abs = path.resolve(target);
-    let cfg;
-    try { cfg = loadConfig(CFG); } catch { res.writeHead(500); res.end('配置读不了'); return; }
-    // 先解析软链再做归属判断：否则工作区里一个指向外部的链接就能读到任意文件
-    let real = abs;
-    try { real = fs.realpathSync(abs); } catch { /* 文件不存在，后面 stat 会报 */ }
-
-    // 工作区现在按任务隔离（.sandbox/t<id>/<节点>），配置里存的是短名，
-    // 所以不能拿 node.workspace 直接 resolve——那样会指到项目根下不存在的目录。
-    const roots: string[] = [];
-    const sandbox = path.join(SANDBOX_ROOT, '.sandbox');
-    try { roots.push(fs.realpathSync(sandbox)); } catch {}
-    for (const n of cfg.nodes) {
-      if (workspaceIsIsolated(n)) continue;
-      try { roots.push(fs.realpathSync(path.resolve(n.workspace))); } catch {}
-    }
-    const inScope = roots.some((root) => inside(root, real));
-    if (!inScope) { res.writeHead(403); res.end('不在任何节点的工作区内'); return; }
-    try {
-      const st = fs.statSync(real);
-      if (!st.isFile()) throw new Error('不是文件');
-      const ext = path.extname(real).toLowerCase();
-      // 产物里可能有模型写的 HTML：给它 CSP sandbox，跑在不透明源里，
-      // 脚本读不到 cookie，也调不动 hub 的写接口（审计 C-2）。
-      // 确实需要脚本渲染的报表由人显式勾选，勾了也仍是 sandbox，只是允许执行。
-      const allowScripts = url.searchParams.get('scripts') === '1';
-      res.writeHead(200, {
-        'Content-Type': MIME[ext] || 'text/plain; charset=utf-8',
-        ...previewHeaders(ext, allowScripts),
-      });
-      res.end(fs.readFileSync(real));
-    } catch (e) {
-      res.writeHead(404);
-      res.end(String(e));
-    }
+    // 实现在 routes/artifact.ts：越界判断、软链、CSP 三条防线都在那边
+    handleArtifact(url, res, CFG);
     return;
   }
 
@@ -561,13 +517,25 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
     // 先把任务建出来再写响应头：这样能带上 X-Task-Id，
     // 页面不用等第一条 SSE 就知道该切到哪个任务（否则要等流开始，看起来像没启动）
+    // 高风险动作在开跑前就拦住：删/移/改名/改协议/动资产库这类活，
+    // 跑到一半才发现要删东西，回滚成本比一开始停一下高得多。
+    // 判定只看任务正文（关键词），误判的代价是多点一次确认。
+    const risks = needsSignoff(task);
     let taskId = 0;
     try {
       taskId = createTask(DB, {
         master,
         task,
         configSnapshot: takeSnapshot(cfg, loadLessons()),
+        // 命中风险的任务直接建成 blocked：调度器不认领 blocked，等于天然停住
+        initialState: risks.length ? 'blocked' : 'queued',
       });
+      if (risks.length) {
+        setTaskState(DB, taskId, 'blocked', {
+          errorCode: 'risk_hold',
+          errorMessage: `高风险任务，等你确认：${riskText(risks)}`,
+        });
+      }
     } catch (e) {
       json(res, 500, { error: String(e) });
       return;
@@ -703,6 +671,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         messages: listMessages(DB, id),
         log: bus.history(id),
         resumedBy: kid ? kid.id : 0,
+        // 失败诊断：任务 failed 后主控自己复盘的那一段，没有就是空串
+        diagnosis: loadDiagnosis(id),
         waitingApproval,
       });
       return;
@@ -1045,6 +1015,100 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 202, { ok: true, state: 'cancelling' });
       return;
     }
+
+    // 暂停：和取消走同一条 abort，终态记 paused。
+    // 恢复不靠「把进程接着跑」，而是复用续跑链——CLI 是一次性进程，没得 resume。
+    const pz = /^\/api\/tasks\/(\d+)\/pause$/.exec(p);
+    if (pz && req.method === 'POST') {
+      const id = Number(pz[1]);
+      const ok = scheduler.cancel(id, 'pause');
+      if (!ok) {
+        const row = DB.prepare('SELECT state FROM tasks WHERE id = ?').get(id) as
+          | { state: string }
+          | undefined;
+        if (row?.state === 'queued') {
+          expirePending(DB, id, '任务还没开跑就被暂停');
+          setTaskState(DB, id, 'paused', { errorCode: 'paused_before_start' });
+          json(res, 200, { ok: true, state: 'paused' });
+        } else {
+          json(res, 404, { error: row ? `任务 ${id} 不在运行（${row.state}）` : `没有任务 ${id}` });
+        }
+        return;
+      }
+      json(res, 202, { ok: true, state: 'pausing' });
+      return;
+    }
+
+    // 高风险任务的人工签核：确认后才从 blocked 放回队列
+    const rk = /^\/api\/tasks\/(\d+)\/approve-risk$/.exec(p);
+    if (rk && req.method === 'POST') {
+      const id = Number(rk[1]);
+      const row = DB.prepare('SELECT state, error_code FROM tasks WHERE id = ?').get(id) as
+        | { state: string; error_code: string | null }
+        | undefined;
+      if (!row) { json(res, 404, { error: `没有任务 ${id}` }); return; }
+      if (row.state !== 'blocked' || row.error_code !== 'risk_hold') {
+        json(res, 400, { error: `这个任务不是在等风险确认（${row.state} / ${row.error_code || '无标记'}）` });
+        return;
+      }
+      // setTaskState 用 COALESCE 保留旧值，清不掉标记，这里直接写
+      DB.prepare('UPDATE tasks SET state = ?, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ?')
+        .run('queued', Date.now(), id);
+      json(res, 200, { ok: true, state: 'queued' });
+      return;
+    }
+
+    /**
+     * 删任务。默认只删数据库记录 + 归档清单，**不删 .sandbox 里的产物**：
+     * 产物是证据，删了就追溯不了。确实要腾空间再加 ?purge=1 连工作区一起删。
+     * 运行中的任务不许删——先停。
+     */
+    const dl = /^\/api\/tasks\/(\d+)$/.exec(p);
+    if (dl && req.method === 'DELETE') {
+      const id = Number(dl[1]);
+      const row = DB.prepare('SELECT state FROM tasks WHERE id = ?').get(id) as
+        | { state: string }
+        | undefined;
+      if (!row) { json(res, 404, { error: `没有任务 ${id}` }); return; }
+      if (['running', 'queued', 'cancelling', 'pausing'].indexOf(row.state) >= 0) {
+        json(res, 400, { error: `任务还在跑（${row.state}），先停止再删` });
+        return;
+      }
+      const purge = url.searchParams.get('purge') === '1';
+      const removed: string[] = [];
+      try {
+        // 顺序有讲究：先删引用方，再删任务本身
+        DB.prepare('DELETE FROM runs WHERE task_id = ?').run(id);
+        DB.prepare('DELETE FROM checkpoints WHERE task_id = ?').run(id);
+        DB.prepare('DELETE FROM messages WHERE task_id = ?').run(id);
+        DB.prepare('DELETE FROM approvals WHERE task_id = ?').run(id);
+        DB.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+        removed.push('数据库记录');
+      } catch (e) {
+        json(res, 500, { error: '删数据库记录失败：' + String(e) });
+        return;
+      }
+      const arch = removeArchive(id);
+      if (arch) removed.push('归档 ' + arch);
+      try {
+        const dg = path.join(DATA_DIR, 'diagnosis', id + '.md');
+        if (fs.existsSync(dg)) { fs.rmSync(dg, { force: true }); removed.push('诊断'); }
+      } catch {}
+      if (purge) {
+        const ws = path.join(SANDBOX_ROOT, '.sandbox', 't' + id);
+        try {
+          if (fs.existsSync(ws)) { fs.rmSync(ws, { recursive: true, force: true }); removed.push('工作区'); }
+        } catch (e) {
+          removed.push('工作区删除失败：' + String(e).slice(0, 80));
+        }
+      }
+      json(res, 200, {
+        ok: true,
+        removed,
+        note: purge ? '工作区已一并删除' : '产物仍留在 .sandbox 里；要一并删加 ?purge=1',
+      });
+      return;
+    }
   }
 
   // 续跑：任务被打断/失败后，把「已经交付了什么」写进新任务的正文，
@@ -1058,7 +1122,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         | { id: number; master: string; task: string; state: string }
         | undefined;
       if (!t) { json(res, 404, { error: `没有任务 ${id}` }); return; }
-      if (['interrupted', 'failed', 'canceled', 'blocked'].indexOf(t.state) < 0) {
+      if (['interrupted', 'failed', 'canceled', 'blocked', 'paused'].indexOf(t.state) < 0) {
         json(res, 400, { error: `只有没跑完的任务能续跑（现在是 ${t.state}）` });
         return;
       }
@@ -1138,71 +1202,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   // ---- 对话模式：问状况、叫停后转向、追问细节 ----
   // 不走 runTree：这是人和单个节点的一对一聊天，没有派活、没有回执、不验产物。
-  if (p === '/api/chat/stream') {
-    const nodeId = url.searchParams.get('node') || '';
-    if (!CHAT_NODE_RE.test(nodeId)) { json(res, 400, { error: 'node 不合法' }); return; }
-    const off = subscribe(nodeId, res);
-    req.on('close', off);
-    return;
-  }
-
-  if (p === '/api/chat/busy') {
-    // 界面据此点亮正在对话的 agent 格子
-    json(res, 200, { nodes: busyNodes() });
-    return;
-  }
-
-  if (p === '/api/chat/history') {
-    const nodeId = url.searchParams.get('node') || '';
-    // 同样会读 .data/chat/<id>.jsonl，格式不合法直接拒
-    if (!CHAT_NODE_RE.test(nodeId)) { json(res, 400, { error: 'node 不合法' }); return; }
-    json(res, 200, { messages: chatHistory(nodeId), busy: isBusy(nodeId) });
-    return;
-  }
-
-  if (p === '/api/chat' && req.method === 'POST') {
-    const body = await readJson(req);
-    const nodeId = String(body.nodeId || '');
-    const text = String(body.text || '').trim();
-    // nodeId 会被拼进文件路径（.data/chat/<id>.jsonl）。
-    // 不先卡格式，`../marker` 就能删/读聊天目录外的文件（审计 M2）。
-    if (!CHAT_NODE_RE.test(nodeId)) { json(res, 400, { error: 'nodeId 不合法' }); return; }
-    let cfg;
-    try { cfg = loadConfig(CFG); } catch (e) { json(res, 500, { error: String(e) }); return; }
-    // 存在性校验必须在 reset 之前：reset 会删文件，删之前得先确认这个节点真的存在
-    const node = cfg.nodes.find((n) => n.id === nodeId);
-    if (!node) { json(res, 404, { error: `没有节点 ${nodeId}` }); return; }
-    if (body.reset) {
-      if (isBusy(nodeId)) { json(res, 400, { error: '它还在答，先停一下' }); return; }
-      resetChat(nodeId);
-      json(res, 200, { ok: true, reset: true });
-      return;
-    }
-    if (!text) { json(res, 400, { error: '没写内容' }); return; }
-    if (text.length > CHAT_MAX) { json(res, 400, { error: `一句话最多 ${CHAT_MAX} 字` }); return; }
-    const r = startChat({
-      nodeId,
-      text,
-      model: node.model,
-      // 对话是「人在问项目」，所以默认站在项目根，而不是空的任务工作区
-      // 对话站的项目目录：优先环境变量，其次配置里的 project.root，最后才猜
-      cwd: process.env.MA_CHAT_CWD || cfg.project?.root || path.join(path.dirname(CFG), '..', 'Game'),
-      plugin: node.plugin,
-      taskSnapshot: chatTaskSnapshot(),
-      projectName: cfg.project?.name || '',
-      projectRoot: cfg.project?.root || '',
-    });
-    if (!r.ok) { json(res, 409, { error: r.error }); return; }
-    json(res, 202, { ok: true });
-    return;
-  }
-
-  if (p === '/api/chat/stop' && req.method === 'POST') {
-    const body = await readJson(req);
-    const nodeId = String(body.nodeId || '');
-    json(res, 200, { ok: stopChat(nodeId) });
-    return;
-  }
+  // 对话的五个入口都在 routes/chat.ts：nodeId 校验与会话管理集中在一处
+  if (await handleChat(p, req, res, url, {
+    cfgFile: CFG,
+    maxLen: CHAT_MAX,
+    snapshot: chatTaskSnapshot,
+    readJson,
+    json,
+    fallbackCwd: () => chatFallbackCwd(CFG),
+  })) return;
 
   if (p === '/api/log') {
     const id = Number(url.searchParams.get('id') || 0);
@@ -1300,15 +1308,30 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (concurrency === null) { json(res, 400, { error: 'concurrency 要是 1–16 的整数' }); return; }
       if (maxTokens === null) { json(res, 400, { error: 'max_tokens 要是 0–100000000 的整数' }); return; }
       if (maxMinutes === null) { json(res, 400, { error: 'max_minutes 要是 0–1440 的整数' }); return; }
+      // 诊断开关：不传就保持默认开（失败时人最需要「为什么」）
+      const diagnose = s.diagnose === undefined
+        ? DEFAULT_LIMITS.diagnose
+        : (s.diagnose === true || s.diagnose === 1 || String(s.diagnose) === 'true');
       const saved = await mutateConfig(CFG, (disk) => {
-        disk.limits = { concurrency, maxTokens, maxMinutes };
+        disk.limits = { concurrency, maxTokens, maxMinutes, diagnose };
         return disk.limits;
-      });
+      }) ?? DEFAULT_LIMITS;
       json(res, 200, {
         ok: true,
         limits: saved,
         restartRequired: saved.concurrency !== CONCURRENCY,
       });
+      return;
+    }
+  }
+
+  // 归档清单：产物复制到哪、字节数、sha256，都在这份 manifest 里
+  {
+    const am = /^\/api\/archive\/(\d+)$/.exec(p);
+    if (am && req.method === 'GET') {
+      const mf = readManifest(Number(am[1]));
+      if (!mf) { json(res, 404, { error: '这个任务还没归档（归档在任务结束后几秒内完成）' }); return; }
+      json(res, 200, { manifest: mf });
       return;
     }
   }

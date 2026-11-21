@@ -14,6 +14,13 @@ max_detail = 4000
 name = "示例项目"
 root = "D:/YourProject"
 
+# 通知（可选）：任务进终态时喊一声。不配就只走界面内的提示。
+# webhook 按地址自动适配格式：企业微信群机器人 / Server酱 / PushPlus / 通用 JSON。
+# 多个通道用 webhook / webhook2 / webhook3，或用逗号分隔。
+#[notify]
+#webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME"
+#on = "blocked,failed,done"
+
 [limits]
 # 同时跑几个 CLI 进程（和任务内车道共用这个池）。1–16
 concurrency = 3
@@ -21,6 +28,8 @@ concurrency = 3
 max_tokens = 0
 # 单任务时长上限（分钟），0 = 不限
 max_minutes = 0
+# 失败后要不要让主控自己复盘一轮（多一次模型调用，换来「为什么失败」）
+diagnose = true
 
 [spawn]
 auto_approve = false

@@ -294,8 +294,18 @@ const CHAT_PROMPT = [
   '- 你的产出是「方案」，不是「结果」。执行是主控和五条线的事',
   '',
   '【你的权限】',
-  '你可以读写 {{ROOT}}。但对话阶段以「看清楚、说清楚」为主，除非用户明确要求，不要擅自大改文件。',
-  '真要动文件，先说清动哪几个、为什么。',
+  '你可以读写 {{ROOT}}，但**这一轮默认是只读的**：写盘工具没有开给你。',
+  '',
+  '要改文件，必须先在回答末尾写一个改动计划块，等我点头：',
+  '```ma-edit-plan',
+  '{"files":["要改的文件路径1","路径2"],"reason":"一句话说清为什么改","risk":"low 或 high"}',
+  '```',
+  '规则：',
+  '- files 必须是**具体文件**，不能写目录、不能写「若干文件」；最多 12 个',
+  '- risk 写 high 的情况：删除、移动、改协议版本、动资产库、一次改超过 5 个文件',
+  '- 写完这个块就停下，不要继续调用写工具（也调不动）',
+  '- 我点了「允许修改」之后，下一轮你才真的能写；那一轮只改计划里列的文件',
+  '- 如果只是问问题、看代码、出方案，不要写这个块',
 ].join('\n');
 
 export function stopChat(nodeId: string, silent = false): boolean {
@@ -312,6 +322,37 @@ export function stopChat(nodeId: string, silent = false): boolean {
   live.delete(nodeId);
   if (!silent) broadcast(nodeId, { t: 'error', error: '已手动停止' });
   return true;
+}
+
+/**
+ * 从回答里抠出「改动计划」块。
+ *
+ * 这是对话写盘的第一道闸：模型想改文件，必须先在这里列出具体文件。
+ * 解析失败就当作没提——宁可让它再问一次，也不要凭一段坏 JSON 给它写权限。
+ */
+export function parseEditPlan(text: string): (EditGrant & { risk?: string }) | null {
+  const m = /```ma-edit-plan\s*\n([\s\S]*?)```/.exec(text || '');
+  if (!m) return null;
+  try {
+    const j = JSON.parse(m[1].trim()) as Record<string, unknown>;
+    const raw = Array.isArray(j.files) ? j.files : [];
+    const files = raw
+      // 只认字符串：数字会被 String() 变成 "123" 这种看起来像路径的垃圾
+      .filter((x) => typeof x === 'string')
+      .map((x) => (x as string).trim())
+      .filter((x) => !!x)
+      // 目录不算：写目录意味着「整个目录随便改」，那不是授权是空白支票
+      .filter((x) => !/[\\/]$/.test(x))
+      .slice(0, 12);
+    if (!files.length) return null;
+    return {
+      files,
+      reason: typeof j.reason === 'string' ? j.reason.slice(0, 200) : undefined,
+      risk: typeof j.risk === 'string' ? j.risk.slice(0, 20) : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -357,6 +398,17 @@ export type ChatInput = {
   /** 项目名与根目录，来自 agents.toml 的 [project] */
   projectName?: string;
   projectRoot?: string;
+  /**
+   * 用户在上一轮点了「允许修改」后带过来的授权。
+   * 有授权的那一轮才开写工具、才切 acceptEdits；没有就是只读。
+   */
+  grant?: EditGrant;
+};
+
+/** 一次改动授权：改哪些文件、为什么 */
+export type EditGrant = {
+  files: string[];
+  reason?: string;
 };
 
 /**
@@ -389,17 +441,36 @@ export function startChat(inp: ChatInput): { ok: boolean; error?: string } {
   // 换 session 前缀、手动清 session、CLI 会话过期都会走到这里。
   const recap = oldSid ? '' : buildRecap(chatHistory(inp.nodeId));
 
+  /** 这一轮有没有写授权。有就把提示词换成「执行上一条计划」 */
+  const granted = !!inp.grant && Array.isArray(inp.grant.files) && inp.grant.files.length > 0;
+  /** 授权的文件清单拼进提示词：模型据此知道能改哪些，多改就是违约 */
+  const grantedFiles = granted ? inp.grant!.files : [];
+  const grantedWhy = granted ? (inp.grant!.reason || '') : '';
+  const grantNote = granted
+    ? '\n\n【本轮已获授权】\n用户已允许你修改这些文件：\n'
+      + grantedFiles.map((f) => '- ' + f).join('\n')
+      + (grantedWhy ? '\n理由：' + grantedWhy : '')
+      + '\n只改这些文件，改完说清每处改了什么。计划外的文件一律不要碰。'
+    : '';
+  const userText = inp.text + grantNote;
+
   const args = [
-    '-p', inp.text,
+    '-p', userText,
     '--output-format', 'stream-json',
     '--session-id', sid,
     '--append-system-prompt', buildChatSystem(inp.taskSnapshot, { name: inp.projectName || '', root: inp.projectRoot || '' }) + recap,
-    // 只给读、搜、改、跑命令这几类。不给 Task*：给了它就会把「出方案」变成
-    // 「给自己排 todo 然后一条条执行」，实测能空转好几分钟还不出方案。
-    '--tools', 'Read,Glob,Grep,Bash,AskUserQuestion',
-    // 只读计划模式：对话是「定方案」，不是「执行」。
-    // 之前没这个限制，问一句「任务进度如何」，它自己拉起子 agent 跑了 512 秒去审计。
-    '--permission-mode', 'plan',
+    // 工具集按「有没有授权」切换：
+    // - 没授权：只给读、搜、跑只读命令。不给 Task*（给了它就会把「出方案」变成
+    //   「给自己排 todo 然后一条条执行」，实测能空转好几分钟）。
+    // - 有授权：放开 Write/Edit，权限模式切 acceptEdits。
+    // 为什么不做成「逐次工具调用确认」：CLI 是非交互的，一次要改 5 个文件
+    // 就得点 5 次；而且它内部执行工具时没有可回调的钩子。轮次级授权是能做到的
+    // 最细粒度，也足够安全——那一轮只改计划里列的文件。
+    ...(granted
+      ? ['--tools', 'Read,Glob,Grep,Bash,Write,Edit,AskUserQuestion',
+         '--permission-mode', 'acceptEdits']
+      : ['--tools', 'Read,Glob,Grep,Bash,AskUserQuestion',
+         '--permission-mode', 'plan']),
   ];
   if (inp.model) args.push('--model', inp.model);
 

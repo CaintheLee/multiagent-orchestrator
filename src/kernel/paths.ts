@@ -41,3 +41,15 @@ export const UI_FILE = path.join(PKG_ROOT, 'ui', 'index.html');
  * 用包根而不是 cwd——工作区属于这个实例，不属于"你在哪敲的命令"。
  */
 export const SANDBOX_ROOT = PKG_ROOT;
+
+/**
+ * 归档区：任务结束后把产物复制一份到这里，长期可查。
+ *
+ * 为什么不放项目目录：归档是「这个编排实例做过什么」的记录，
+ * 属于 MultiAgent 而不是被编排的那个项目。放项目里会污染对方的仓库。
+ * 为什么放 .data 下：和任务库、轮次同源，备份一个目录就够；
+ * 需要给人看时用 /api/archive 或直接开这个路径。
+ */
+export const ARCHIVE_DIR = process.env.MA_ARCHIVE
+  ? path.resolve(process.env.MA_ARCHIVE)
+  : path.join(DATA_DIR, 'archive');

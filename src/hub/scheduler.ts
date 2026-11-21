@@ -1,5 +1,6 @@
 // 调度器：从队列认领任务、并发执行、可取消。
 // 状态以数据库为准，内存里只放「正在跑的 AbortController」——那东西没法持久化。
+import fs from 'node:fs';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { loadConfig, nodeById } from '../kernel/tree.ts';
@@ -9,6 +10,11 @@ import { setTaskState } from '../store/db.ts';
 import { expirePending } from '../store/approvals.ts';
 import { appendJournal } from '../kernel/memory.ts';
 import { dropPending } from '../store/messages.ts';
+import { archiveTask } from '../kernel/archive.ts';
+import { buildDiagnosisBrief, cleanDiagnosis, saveDiagnosis } from '../kernel/diagnose.ts';
+import { sendWebhook, shouldNotify, notifyText } from '../kernel/notify.ts';
+import { runAgent } from '../adapters/spawn.ts';
+import { readRunJson } from '../store/run-cache.ts';
 
 export type ClaimedTask = {
   id: number;
@@ -30,6 +36,12 @@ const TICK_MS = 400;
 
 export class Scheduler {
   private active = new Map<number, AbortController>();
+  /**
+   * 正在「暂停」的任务。
+   * cancel 和 pause 走同一条路（都是 abort），区别只在收尾时记哪个状态。
+   * 用一个集合记住意图，比在 AbortSignal 上挂字段可靠。
+   */
+  private pausing = new Set<number>();
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
 
@@ -68,9 +80,17 @@ export class Scheduler {
     return this.opts.maxConcurrent;
   }
 
-  cancel(taskId: number): boolean {
+  /**
+   * 取消 / 暂停。
+   *
+   * 两者都是 abort 当前轮次，差别只在终态：canceled 是「这事不要了」，
+   * paused 是「先停在这，之后接着跑」。真正的「恢复」走续跑链——
+   * CLI 是一次性进程，没有可 resume 的会话，所以暂停的语义就是「存快照」。
+   */
+  cancel(taskId: number, mode: 'cancel' | 'pause' = 'cancel'): boolean {
     const ac = this.active.get(taskId);
     if (!ac) return false;
+    if (mode === 'pause') this.pausing.add(taskId);
     // 先标 cancelling：进程退出前任务状态不能直接跳 canceled
     try {
       setTaskState(this.opts.db, taskId, 'cancelling');
@@ -152,6 +172,104 @@ export class Scheduler {
     return row ?? null;
   }
 
+  /**
+   * 把一条状态变化发给所有配置的通道。
+   *
+   * 并发发、各自超时 5 秒，任何一个失败都不影响其他通道，也不影响任务。
+   */
+  private fanout(
+    taskId: number,
+    state: string,
+    taskText: string,
+    why: string | undefined,
+    settings: import('../kernel/tree.ts').NotifySettings,
+    log: (line: string) => void,
+  ): void {
+    const text = notifyText(taskId, state, taskText, why);
+    for (const target of settings.targets ?? []) {
+      if (!target?.webhook) continue;
+      void sendWebhook(target, text).then((r) => {
+        if (!r.ok) log(`通知失败（${r.hint || 'webhook'}）：${r.error || r.status}`);
+      }).catch(() => {
+        // sendWebhook 自己已经兜住异常，这里只是双保险
+      });
+    }
+  }
+
+  /**
+   * 失败诊断：让主控读一遍自己的失败记录，给「原因 + 下一步」。
+   *
+   * 不占用车位、不影响任务状态：它跑在任务终态之后，失败只记日志。
+   * 超时给 3 分钟：诊断比干活短得多，卡住就说明模型那边有问题。
+   */
+  private async diagnose(
+    taskId: number,
+    taskText: string,
+    state: string,
+    cfg: import('../kernel/tree.ts').Config,
+    log: (line: string) => void,
+  ): Promise<void> {
+    try {
+      const head = this.opts.db.prepare(
+        'SELECT error_message FROM tasks WHERE id = ?',
+      ).get(taskId) as { error_message?: string } | undefined;
+      const rows = this.opts.db.prepare(
+        'SELECT id, node_id, state, verdict, ms, json_path FROM runs WHERE task_id = ? ORDER BY id',
+      ).all(taskId) as Array<{
+        id: number; node_id: string; state: string; verdict: string | null;
+        ms: number; json_path: string;
+      }>;
+      const runs = rows.map((r) => {
+        const j = readRunJson<{
+          summary?: string;
+          error?: string;
+          warnings?: string[];
+          artifacts?: Array<{ path?: string }>;
+        }>(String(r.json_path));
+        return {
+          id: r.id,
+          node: r.node_id,
+          state: r.state,
+          verdict: r.verdict,
+          ms: r.ms,
+          summary: j?.summary ?? '',
+          error: j?.error ?? '',
+          warnings: j?.warnings ?? [],
+          artifacts: (j?.artifacts ?? []).filter((a) => a && a.path),
+        };
+      });
+
+      const node = nodeById(cfg, cfg.root.id);
+      const brief = buildDiagnosisBrief({
+        taskId,
+        task: taskText,
+        state,
+        error: String(head?.error_message || ''),
+        runs,
+      });
+
+      // 站在任务自己的工作区里：诊断可能要读产物，那里离文件最近
+      const cwd = path.join(this.opts.root, '.sandbox', 't' + taskId);
+      log('开始生成失败诊断（主控复盘，不动手）');
+      const r = await runAgent(node.plugin, {
+        prompt: brief,
+        cwd: fs.existsSync(cwd) ? cwd : this.opts.root,
+        timeoutMs: 3 * 60_000,
+        access: 'read',
+        model: node.model,
+      });
+      const text = cleanDiagnosis(r.stdout);
+      if (!text) {
+        log(`诊断没有产出内容（exit=${r.exitCode}）`);
+        return;
+      }
+      const f = saveDiagnosis(taskId, `# 任务 #${taskId} 失败诊断\n\n生成于 ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${text}\n`);
+      log(f ? `失败诊断已生成：${f}` : '失败诊断已生成，但落盘失败');
+    } catch (e) {
+      log(`诊断失败（不影响任务）：${String(e).slice(0, 160)}`);
+    }
+  }
+
   private async run(task: ClaimedTask): Promise<void> {
     const ac = new AbortController();
     this.active.set(task.id, ac);
@@ -182,7 +300,8 @@ export class Scheduler {
       // 取消可能停在两轮之间（那时 rec 是 null），要认 signal 而不是 null
       const finalState = !rec
         ? ac.signal.aborted
-          ? 'canceled'
+          // 暂停和取消都 abort，靠意图集合区分终态
+          ? (this.pausing.has(task.id) ? 'paused' : 'canceled')
           : 'failed'
         : rec.state === 'done'
           // 验收判了 rework 就是没过：以前只看 state，补验两次都核不上也会记成 done
@@ -200,7 +319,73 @@ export class Scheduler {
         // 只写「卡住，等回答」等于让人重新去翻日志
         errorMessage: rec?.question || rec?.error,
       });
+      // 归档：把交付物复制到 .data/archive/<月>/t<id>/，附 manifest。
+      // 放 setTimeout 里不阻塞调度器——复制几百个文件可能要几秒，
+      // 卡在这里会让下一个任务干等。失败只记日志，绝不影响已经跑完的任务。
+      const archTaskId = task.id;
+      const archState = finalState;
+      const archTask = task.task;
+      setTimeout(() => {
+        try {
+          const head = this.opts.db.prepare(
+            'SELECT created_at, ended_at FROM tasks WHERE id = ?',
+          ).get(archTaskId) as { created_at?: number; ended_at?: number } | undefined;
+          // 轮次表里只有索引，artifacts/summary 在 json 文件里，得逐个读
+          const rows = this.opts.db.prepare(
+            'SELECT id, node_id, state, verdict, ms, json_path FROM runs WHERE task_id = ? ORDER BY id',
+          ).all(archTaskId) as Array<{
+            id: number; node_id: string; state: string; verdict: string | null;
+            ms: number; json_path: string;
+          }>;
+          const runs = rows.map((r) => {
+            const j = readRunJson<{
+              summary?: string;
+              artifacts?: Array<{ path?: string; bytes?: number }>;
+            }>(String(r.json_path));
+            return {
+              id: r.id,
+              node: r.node_id,
+              state: r.state,
+              verdict: r.verdict,
+              ms: r.ms,
+              summary: j?.summary ?? '',
+              artifacts: (j?.artifacts ?? []).filter((a) => a && a.path),
+            };
+          });
+          const dir = archiveTask({
+            taskId: archTaskId,
+            state: archState,
+            task: archTask,
+            createdAt: head?.created_at ?? Date.now(),
+            endedAt: head?.ended_at ?? Date.now(),
+            project: { name: cfg.project?.name || '', root: cfg.project?.root || '' },
+            runs,
+          });
+          if (dir) this.opts.onLog(archTaskId, `已归档：${dir}`);
+        } catch (e) {
+          this.opts.onLog(archTaskId, `归档失败（不影响任务）：${String(e).slice(0, 160)}`);
+        }
+      }, 0).unref();
+
       this.opts.onState(task.id, finalState);
+      this.pausing.delete(task.id);
+
+      // 微信/自建 webhook 通知：不 await，失败只记一条日志
+      const notifyCfg = cfg.notify;
+      if (notifyCfg && shouldNotify(notifyCfg, finalState)) {
+        this.fanout(task.id, finalState, task.task, rec?.question || rec?.error, notifyCfg, log);
+      }
+
+      // 失败诊断：只对 failed 做。blocked 是等人回答、canceled 是主动停，
+      // 这两种都不需要诊断——一个在等输入，一个是人自己叫停的。
+      if (finalState === 'failed' && (cfg.limits?.diagnose ?? true)) {
+        const diagTaskId = task.id;
+        const diagText = task.task;
+        setTimeout(() => {
+          void this.diagnose(diagTaskId, diagText, finalState, cfg, log);
+        }, 0).unref();
+      }
+
       // 任务结束了，还没投出去的留言跟这个任务一起作废，别留一堆永远 pending 的僵尸
       try { dropPending(this.opts.db, task.id); } catch {}
 

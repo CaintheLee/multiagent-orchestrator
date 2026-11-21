@@ -1,4 +1,4 @@
-import { CONFIG_FILE, PROMPTS_DIR, PROVIDERS_FILE, SANDBOX_ROOT } from '../kernel/paths.ts';
+import { CONFIG_FILE, DATA_DIR, PROMPTS_DIR, PROVIDERS_FILE, SANDBOX_ROOT } from '../kernel/paths.ts';
 // 命令行入口：run / status / check。跑任务的逻辑在 runner.ts，界面在 server.ts。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -266,6 +266,87 @@ function cmdCheck(): void {
   console.log(`  协议上限：summary ${cfg.maxSummary} 字 / detail ${cfg.maxDetail} 字`);
 }
 
+/**
+ * 换项目：把记忆与对话搬走留档，其余保持原样。
+ *
+ * 为什么「搬走」而不是「删掉」（决策 P1-12）：换项目后旧记忆会污染新任务
+ * （主控会以为自己还在做上一个项目）。但直接删等于把踩过的坑一起丢了，
+ * 所以移到 .data/archive/<项目>-<日期>/ 下，需要时还能翻。
+ *
+ * 刻意不动 prompts/：那些是通用职责模板，换项目还要用。
+ * context.md 清空但留一份空模板：它是手写文件，得人来填新项目的底图。
+ */
+function cmdSwitchProject(): void {
+  const cfg = loadConfig(CFG);
+  const name = (cfg.project?.name || '未命名').replace(/[\\/:*?"<>|]/g, '_');
+  const stamp = new Date().toISOString().slice(0, 10);
+  const dest = path.join(DATA_DIR, 'archive', `${name}-${stamp}`);
+  const memoryDir = path.join(DATA_DIR, 'memory');
+  const chatDir = path.join(DATA_DIR, 'chat');
+
+  const moved: string[] = [];
+  const keep = new Set(['context.md']);   // 这个单独处理
+  try {
+    fs.mkdirSync(path.join(dest, 'memory'), { recursive: true });
+    for (const f of fs.existsSync(memoryDir) ? fs.readdirSync(memoryDir) : []) {
+      if (!/\.md$/.test(f) || keep.has(f)) continue;
+      const from = path.join(memoryDir, f);
+      fs.renameSync(from, path.join(dest, 'memory', f));
+      moved.push('memory/' + f);
+    }
+  } catch (e) {
+    console.error('搬记忆失败：' + String(e));
+  }
+  try {
+    if (fs.existsSync(chatDir)) {
+      fs.mkdirSync(path.join(dest, 'chat'), { recursive: true });
+      for (const f of fs.readdirSync(chatDir)) {
+        fs.renameSync(path.join(chatDir, f), path.join(dest, 'chat', f));
+        moved.push('chat/' + f);
+      }
+    }
+  } catch (e) {
+    console.error('搬对话失败：' + String(e));
+  }
+
+  // context.md 换成空模板：手写文件需要人重填，留旧的等于让主控读错项目
+  try {
+    fs.writeFileSync(
+      path.join(memoryDir, 'context.md'),
+      [
+        '# 项目索引（换项目后需手写重填）',
+        '',
+        '> 这份文件每轮都会注入主控提示词。空着比写错的强。',
+        '',
+        '## 现在在哪',
+        '- （项目根、当前版本、当前阶段）',
+        '',
+        '## 先读哪几份',
+        '- （按路由列 3–5 个入口文件，不要整包读）',
+        '',
+        '## 硬规格',
+        '- （尺寸、帧率、命名约定这类不能猜的）',
+        '',
+        '## 禁忌',
+        '- （不许动的东西）',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    moved.push('memory/context.md（已重置为空模板）');
+  } catch (e) {
+    console.error('重置 context.md 失败：' + String(e));
+  }
+
+  console.log(`换项目留档：${dest}`);
+  for (const m of moved) console.log('  · ' + m);
+  console.log('');
+  console.log('接下来手动做两件事：');
+  console.log('  1. 写 .data/memory/context.md（新项目的底图）');
+  console.log('  2. 改 agents.toml 的 [project] 段（name / root）');
+  console.log('prompts/ 里的职责模板没有动，可以直接用。');
+}
+
 const cmd = process.argv[2];
 if (cmd === 'run') await cmdRun();
 else if (cmd === 'status') cmdStatus();
@@ -282,6 +363,7 @@ else if (cmd === 'doctor') {
   console.log(`\n${items.length} 项检查：${fails} 个失败，${warns} 个提醒`);
   if (!ok) process.exitCode = 1;
 }
+else if (cmd === 'switch-project') cmdSwitchProject();
 else if (cmd === 'learn') await cmdLearn();
 else if (cmd === 'lessons') {
   const t = loadLessons();
@@ -295,5 +377,7 @@ else {
   console.log('  doctor 环境自检：provider 路径、role 文件、数据目录、端口');
   console.log('  learn  从历史打回里提炼教训，写进主控提示词');
   console.log('  lessons 看当前教训');
+  console.log('  switch-project 换项目：记忆与对话搬到 .data/archive 留档，context.md 重置');
+  console.log('                 （装之前先备份：搬走不可逆，虽然只是 rename）');
   console.log('  （要界面的话：node src/server.ts 然后开 http://127.0.0.1:3400）');
 }

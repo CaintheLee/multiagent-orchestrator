@@ -51,6 +51,27 @@ export type ProjectInfo = {
 };
 
 /**
+ * 通知配置。
+ *
+ * 只认一个或多个 webhook，按地址形态自动适配格式（见 kernel/notify.ts）。
+ * on 决定哪些终态值得打扰，默认 blocked / failed / done。
+ */
+export type NotifyTarget = {
+  /** webhook 地址；企业微信群机器人 / Server酱 / PushPlus / 自建服务都行 */
+  webhook: string;
+  /** 给这个通道起个名字，日志里好认 */
+  name?: string;
+};
+
+export type NotifySettings = {
+  targets: NotifyTarget[];
+  /** 要通知的终态；空 = 默认三样 */
+  on: string[];
+};
+
+export const DEFAULT_NOTIFY_ON = ['blocked', 'failed', 'done'];
+
+/**
  * 运行上限：不是「能不能做」，而是「最多花多少」。
  *
  * 之前只有轮次预算（每段 +3），它能防「原地打转」，防不了「一轮烧掉几十万 token」。
@@ -63,9 +84,14 @@ export type Limits = {
   maxTokens: number;
   /** 单任务时长上限（分钟），从任务开始算；0 = 不限 */
   maxMinutes: number;
+  /**
+   * 任务失败后要不要再跑一轮「诊断」。
+   * 关掉能省一次调用；开着失败时不用自己翻日志找原因。
+   */
+  diagnose: boolean;
 };
 
-export const DEFAULT_LIMITS: Limits = { concurrency: 3, maxTokens: 0, maxMinutes: 0 };
+export const DEFAULT_LIMITS: Limits = { concurrency: 3, maxTokens: 0, maxMinutes: 0, diagnose: true };
 
 export type Config = {
   schema: number;
@@ -82,6 +108,8 @@ export type Config = {
   project?: ProjectInfo;
   /** 运行上限。可选：老配置没有 [limits] 段，用 DEFAULT_LIMITS */
   limits?: Limits;
+  /** 通知通道。可选：没有 [notify] 段就只走站内 */
+  notify?: NotifySettings;
 };
 
 /**
@@ -250,6 +278,31 @@ export function loadConfig(file: string): Config {
     throw new Error(`这些节点从根 ${root.id} 走不到（parent 成环或指错）：${orphans.join('、')}`);
   }
 
+  /**
+   * [notify] 段：webhook 可以写多个（webhook、webhook2、webhook3），
+   * 也可以写成 targets = "url1, url2"。两种都认，省得人为了加第二条改结构。
+   */
+  const parseNotify = (sec: Record<string, Cell> | undefined): NotifySettings | undefined => {
+    if (!sec) return undefined;
+    const urls: string[] = [];
+    for (const [k, v] of Object.entries(sec)) {
+      if (!/^webhook\d*$/.test(k)) continue;
+      const s = String(v || '').trim();
+      if (!s) continue;
+      if (k === 'webhook' && /[,;\s]/.test(s)) {
+        urls.push(...s.split(/[,;\s]+/).filter(Boolean));
+      } else {
+        urls.push(s);
+      }
+    }
+    if (!urls.length) return undefined;
+    const onRaw = String(sec.on || '').trim();
+    return {
+      targets: urls.map((u, i) => ({ webhook: u, name: 'ch' + (i + 1) })),
+      on: onRaw ? onRaw.split(/[,;\s]+/).filter(Boolean) : [...DEFAULT_NOTIFY_ON],
+    };
+  };
+
   const lim = raw.limits;
   const limitInt = (key: string, def: number, lo: number, hi: number): number => {
     const v = Number(lim?.[key]);
@@ -257,6 +310,11 @@ export function loadConfig(file: string): Config {
     return Math.min(hi, Math.max(lo, Math.round(v)));
   };
 
+  /** 通用的 true/1/'true' 判定，[spawn] 与 [limits] 共用 */
+  const flagOf = (sec: Record<string, Cell> | undefined, key: string): boolean => {
+    const v = sec?.[key];
+    return v === true || v === 1 || String(v) === 'true';
+  };
   const sp = raw.spawn;
   const flag = (key: string): boolean => {
     const v = sp?.[key];
@@ -272,11 +330,14 @@ export function loadConfig(file: string): Config {
     },
     maxSummary: num(raw.protocol, 'max_summary', 200),
     maxDetail: num(raw.protocol, 'max_detail', 4000),
+    notify: parseNotify(raw.notify),
     limits: {
       // 车位上限压到 16：再多就是本机 CPU 和模型限流先撑不住
       concurrency: limitInt('concurrency', DEFAULT_LIMITS.concurrency, 1, 16),
       maxTokens: limitInt('max_tokens', 0, 0, 100_000_000),
       maxMinutes: limitInt('max_minutes', 0, 0, 24 * 60),
+      // 默认开：失败时人最需要的就是「为什么」；写 false 可关
+      diagnose: lim?.diagnose === undefined ? true : flagOf(lim, 'diagnose'),
     },
     spawn: {
       autoApprove: flag('auto_approve'),
@@ -304,12 +365,23 @@ export function saveConfig(cfg: Config, file: string): void {
   out.push(line('name', cfg.project?.name));
   out.push(line('root', cfg.project?.root));
   out.push('\n');
+  // 通知：一个通道一行，人改起来最直观
+  const nt = cfg.notify;
+  if (nt?.targets?.length) {
+    out.push('[notify]\n');
+    nt.targets.forEach((t, i) => {
+      out.push(`webhook${i === 0 ? '' : i + 1} = ${JSON.stringify(t.webhook)}\n`);
+    });
+    out.push(`on = ${JSON.stringify((nt.on?.length ? nt.on : DEFAULT_NOTIFY_ON).join(','))}\n`);
+    out.push('\n');
+  }
   // 运行上限
   const lim = cfg.limits ?? DEFAULT_LIMITS;
   out.push('[limits]\n');
   out.push(`concurrency = ${lim.concurrency}\n`);
   out.push(`max_tokens = ${lim.maxTokens}\n`);
   out.push(`max_minutes = ${lim.maxMinutes}\n`);
+  out.push(`diagnose = ${lim.diagnose ? 'true' : 'false'}\n`);
   out.push('\n');
   // 开线策略：两个开关写死成 true/false（不用 1/0），手改配置时一眼能看懂
   const sp = cfg.spawn ?? DEFAULT_SPAWN;

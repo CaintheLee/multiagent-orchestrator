@@ -23,6 +23,15 @@ export type Provider = {
   /** true：提示词走 stdin；false：拼进 argv */
   stdin: boolean;
   /**
+   * 这个 provider 的参数是否在本机实测过。
+   *
+   * 为什么要这个字段：四家里只有 codebuddy / codex 装在这台机器上，
+   * 另外两家的参数是照各自的命令行约定写的，没跑过。不标出来，
+   * 换台机器接 claude 失败时会以为是编排器的问题，其实是参数没对。
+   * doctor 会把它显示出来。
+   */
+  verified?: boolean;
+  /**
    * 运行时问这个 CLI「现在支持哪些模型」。没有这个方法就说明拿不到，
    * 调用方退回缓存或内置兜底，绝不用写死的列表冒充实时结果。
    */
@@ -136,12 +145,14 @@ export const PROVIDERS: Record<string, Provider> = {
     args: (o) => ['exec', '--skip-git-repo-check', '--sandbox', o.access === 'read' ? 'read-only' : 'workspace-write'],
     stdin: true,
     supportsReadOnly: true,
+    verified: true,
   },
   codebuddy: {
     label: 'CodeBuddy',
     bin: codebuddyBin,
     args: (o) => ['-p', '-y', ...(o.model ? ['--model', o.model] : []), o.prompt],
     stdin: false,
+    verified: true,
     // 模型清单只认 CLI 自己报的：写死的列表会随服务端下线而失真（hy4free 就是这么没的）
     models: async () => {
       const list = parseSupportedModels(await helpText(codebuddyBin()));
@@ -154,12 +165,18 @@ export const PROVIDERS: Record<string, Provider> = {
   claude: {
     label: 'Claude Code',
     bin: claudeBin,
+    // -p 是非交互打印模式，--model 是模型选择：两条都是它的长期约定。
+    // **未在本机实测**（这台机器没装），所以 verified 留空、supportsReadOnly 不给。
+    // 如果确认它支持 `--permission-mode plan`，把 supportsReadOnly 改成 true 并加进 args——
+    // plan 模式真的会拒绝写盘，和 codebuddy 的 plan 一样，不是装饰。
     args: (o) => ['-p', ...(o.model ? ['--model', o.model] : []), o.prompt],
     stdin: false,
   },
   gemini: {
     label: 'Gemini CLI',
     bin: geminiBin,
+    // 同上：-p / --model 是它的约定，未在本机实测。
+    // 它的沙箱是 --sandbox（docker/podman），不是只读开关，所以不给 supportsReadOnly。
     args: (o) => ['-p', ...(o.model ? ['--model', o.model] : []), o.prompt],
     stdin: false,
   },
@@ -229,6 +246,7 @@ export function registerProvidersFrom(file: string): string[] {
         .split('{prompt}').join(o.prompt)
         .split('{model}').join(o.model ?? ''))),
       stdin,
+      // 配置里声明的 provider 一律算「未实测」：它可能只是个包装脚本
     };
     added.push(name);
   }

@@ -52,7 +52,10 @@ async function runViaHub(task: string, nodeId: string): Promise<number> {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
-  let final: { ok?: boolean; state?: string; taskId?: number } | null = null;
+  // 用别名而不是内联类型：`as typeof final` 取的是当前流类型（这里是 null），
+  // 断言完 final 会变成 never，后面的字段访问全报错
+  type FinalEvent = { ok?: boolean; state?: string; taskId?: number };
+  let final: FinalEvent | null = null;
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -66,7 +69,7 @@ async function runViaHub(task: string, nodeId: string): Promise<number> {
       if (!data) continue;
       let parsed: unknown;
       try { parsed = JSON.parse(data); } catch { continue; }
-      if (isDone) final = parsed as typeof final;
+      if (isDone) final = parsed as FinalEvent;
       else console.log(String(parsed));
     }
   }

@@ -32,6 +32,7 @@ function node(id: string, parent: string, name = id): NodeConfig {
     access: 'write',
     role: id === 'a' ? 'dispatcher' : 'executor',
     model: 'hy4free',
+    extraDirs: [],
   };
 }
 
@@ -64,6 +65,7 @@ async function run(
   nodes: NodeConfig[],
   task: string,
   runner: Runner,
+  limits?: { concurrency: number; maxTokens: number; maxMinutes: number },
 ): Promise<{ rec: RunRecord | null; logs: string[]; taskId: number }> {
   const cfg = cfgOf(nodes);
   const taskId = createTask(DB, { master: cfg.root.id, task, configSnapshot: '{}' });
@@ -73,6 +75,7 @@ async function run(
     taskId,
     root: ROOT,
     runner: runner as never,
+    limits,
   });
   return { rec, logs, taskId };
 }
@@ -475,16 +478,16 @@ test('派生申请的任务描述太短就拒，不建审批单', async () => {
 
 // 协议允许 8 段，但单节点收口上限是 6 次。阶段推进时如果不清零，7–8 段的任务
 // 即使每段一次通过，也会在第 7 段收口前被判 blocked（外部审计 M4）。
-test('8 段计划能跑完，不会被收口上限拦下（协议允许的上限）', async () => {
+test('10 段计划能跑完，不会被收口上限拦下（协议允许的上限）', async () => {
   const nodes = [node('a', ''), node('b', 'a')];
-  const PLAN = Array.from({ length: 8 }, (_, i) => ({ id: String(i + 1), name: '第' + (i + 1) + '段' }));
+  const PLAN = Array.from({ length: 10 }, (_, i) => ({ id: String(i + 1), name: '第' + (i + 1) + '段' }));
   let aReview = 0;
 
   const runner: Runner = async (_p, o) => {
     const w = who(o.prompt);
     if (w.id === 'a' && !w.review) {
-      const m = /第 (\d+)\/8 段/.exec(o.prompt);
-      if (!m) return respond({ summary: '切八段', plan: PLAN, dispatch: [{ to: 'b', task: '做第 1 段' }] });
+      const m = /第 (\d+)\/10 段/.exec(o.prompt);
+      if (!m) return respond({ summary: '切十段', plan: PLAN, dispatch: [{ to: 'b', task: '做第 1 段' }] });
       return respond({ summary: '派第 ' + m[1] + ' 段', dispatch: [{ to: 'b', task: '做第 ' + m[1] + ' 段' }] });
     }
     if (w.id === 'b' && !w.review) return respond({ summary: '这一段做完', dispatch: [] });
@@ -492,7 +495,90 @@ test('8 段计划能跑完，不会被收口上限拦下（协议允许的上限
     return respond({ summary: '这一段通过', dispatch: [] });
   };
 
-  const { rec, logs } = await run(nodes, '八段任务', runner);
-  assert.equal(rec?.state, 'done', '8 段应该跑完而不是 blocked:////n' + logs.join('\n'));
-  assert.equal(aReview, 8, `应该收口 8 次（每段一次），实际 ${aReview}`);
+  const { rec, logs } = await run(nodes, '十段任务', runner);
+  assert.equal(rec?.state, 'done', '10 段应该跑完而不是 blocked://n' + logs.join('\n'));
+  assert.equal(aReview, 10, `应该收口 10 次（每段一次），实际 ${aReview}`);
+});
+
+// 收口轮既判 pass 又派了活：阶段推进的 return 会绕过后面的 dispatch 处理，
+// 那些活一条都不会执行，而任务会显示「这一段过了」——静默丢活。
+test('收口轮判 pass 同时还有 dispatch，不能把活丢掉', async () => {
+  const nodes = [node('a', ''), node('b', 'a')];
+  const PLAN = [
+    { id: '1', name: '第一段' },
+    { id: '2', name: '第二段' },
+  ];
+  let aReview = 0;
+  const bWork: string[] = [];
+
+  const runner: Runner = async (_p, o) => {
+    const w = who(o.prompt);
+    if (w.id === 'a' && !w.review) {
+      const m = /第 (\d+)\/2 段/.exec(o.prompt);
+      if (!m) return respond({ summary: '切两段', plan: PLAN, dispatch: [{ to: 'b', task: '做第一段的活' }] });
+      return respond({ summary: '派新活', dispatch: [{ to: 'b', task: '做第 ' + m[1] + ' 段' }] });
+    }
+    if (w.id === 'b' && !w.review) {
+      bWork.push(o.prompt);
+      return respond({ summary: '干完了', dispatch: [] });
+    }
+    aReview++;
+    // 第 1 段收口：判通过，但同时派一条「补个图」的活
+    if (aReview === 1) {
+      return respond({
+        summary: '第 1 段过，顺手补一张图',
+        dispatch: [{ to: 'b', task: '补一张流程图，存 diagram.md' }],
+        evidence: [],
+        phase: '1',
+      });
+    }
+    return respond({ summary: '第 2 段过', dispatch: [], phase: '2' });
+  };
+
+  const { rec, logs } = await run(nodes, '两段任务', runner);
+  const gotExtra = bWork.some((p) => p.includes('补一张流程图'));
+  assert.ok(gotExtra, '收口轮派的活必须被执行，不能被阶段推进吞掉：\n' + logs.join('\n'));
+  assert.equal(rec?.state, 'done');
+});
+
+// 预算熔断：一轮烧掉几十万 token 时，不能等轮次预算用完才停。
+// 停在轮次边界（不是中途杀进程），已交付的产物能保住，加预算可续跑。
+test('token 超过上限就熔断，转 blocked 而不是硬跑到底', async () => {
+  const nodes = [node('a', ''), node('b', 'a')];
+  let calls = 0;
+  const runner: Runner = async (_p, o) => {
+    calls++;
+    const w = who(o.prompt);
+    const r = respond(
+      w.id === 'a' && !w.review
+        ? { summary: '派活', dispatch: [{ to: 'b', task: '干活' }] }
+        : { summary: '收口通过', dispatch: [], evidence: [] },
+    );
+    // 每轮都烧 60 token：上限 100，第二轮结束必然超
+    return { ...r, usage: { input: 40, output: 20, total: 60, steps: 1, ms: 10 } } as typeof r;
+  };
+
+  const { rec, logs } = await run(nodes, '烧钱的任务', runner, {
+    concurrency: 3, maxTokens: 100, maxMinutes: 0,
+  });
+  assert.equal(rec?.state, 'blocked', '超预算应当停下等人：' + logs.join('\n'));
+  assert.match(logs.join('\n'), /预算熔断/);
+  // closeBlocked 把原因放在 summary/question，error 是固定的「卡住，等回答」
+  assert.match(String(rec?.summary ?? ''), /token/);
+  assert.match(String(rec?.question ?? ''), /续跑/);
+  assert.ok(calls >= 2, '至少跑过两轮才可能超限');
+});
+
+test('上限设 0 表示不限，不会误伤', async () => {
+  const nodes = [node('a', ''), node('b', 'a')];
+  const runner: Runner = async (_p, o) => {
+    const w = who(o.prompt);
+    return respond(
+      w.id === 'a' && !w.review
+        ? { summary: '派活', dispatch: [{ to: 'b', task: '干活' }] }
+        : { summary: '收口通过', dispatch: [], evidence: [] },
+    );
+  };
+  const { rec } = await run(nodes, '不限预算', runner, { concurrency: 3, maxTokens: 0, maxMinutes: 0 });
+  assert.equal(rec?.state, 'done');
 });

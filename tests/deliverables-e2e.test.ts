@@ -29,6 +29,7 @@ function node(id: string, parent: string): NodeConfig {
     access: 'write',
     role: id === 'a' ? 'dispatcher' : 'executor',
     model: 'hy4free',
+    extraDirs: [],
   };
 }
 

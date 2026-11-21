@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const { checkArtifacts, inside } = await import('../src/kernel/settle.ts');
+import type { NodeConfig } from '../src/kernel/tree.ts';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-extra-'));
 const ws = path.join(tmp, 'ws');
@@ -28,7 +29,7 @@ const node = {
   role: 'dispatcher',
   model: '',
   extraDirs: [shared],
-} as never;
+} as unknown as NodeConfig;
 
 const receipt = (paths: string[]) =>
   ({ artifacts: paths.map((p) => ({ path: p, kind: 'md', bytes: 0 })) }) as never;
@@ -78,7 +79,8 @@ test('备份失败必须判失败，不能静默放行', () => {
   // 把工作区指向一个普通文件：mkdir _external 会 ENOTDIR，备份必失败
   const fake = path.join(tmp, 'not-a-dir');
   fs.writeFileSync(fake, 'x', 'utf8');
-  const broken = { ...node, workspace: fake } as never;
+  // 故意造一个「工作区是普通文件」的非法节点：类型上不合法，运行时要能兜住
+  const broken: NodeConfig = { ...node, workspace: fake };
 
   const { ok, bad } = checkArtifacts(receipt([f]), broken, { extraDirs: [shared] });
   assert.equal(ok.length, 0, '备份不成就不能登记为已交付');

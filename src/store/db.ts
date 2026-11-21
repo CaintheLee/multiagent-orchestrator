@@ -259,9 +259,9 @@ export function importLegacyRuns(
   }
   void hasLog;
 
-  const maxId = Number(db.prepare('SELECT COALESCE(MAX(id), 0) m FROM runs').get().m);
+  const maxId = Number(db.prepare('SELECT COALESCE(MAX(id), 0) m FROM runs').get()?.m ?? 0);
   const nextId = Number(
-    db.prepare("SELECT COALESCE(seq, 0) s FROM sqlite_sequence WHERE name = 'runs'").get()?.s ?? maxId,
+    db.prepare("SELECT COALESCE(seq, 0) s FROM sqlite_sequence WHERE name = 'runs'").get()?.s ?? maxId ?? 0,
   ) + 1;
 
   return { imported, skipped, maxId, nextId, problems };

@@ -152,4 +152,4 @@ export const ASK_LIMIT = 3;
 export const ASK_MAX = 400;
 
 /** 阶段最多几段。再多就该拆成多个任务了，一个任务串十个阶段没人盯得住 */
-export const PLAN_LIMIT = 8;
+export const PLAN_LIMIT = 10;

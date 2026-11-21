@@ -13,7 +13,13 @@
     "check": "node --disable-warning=ExperimentalWarning src/host/cli.ts check",
     "serve": "node --disable-warning=ExperimentalWarning src/host/server.ts",
     "test": "node --disable-warning=ExperimentalWarning --test \"tests/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm test",
     "eval": "node --disable-warning=ExperimentalWarning evals/run.ts",
     "doctor": "node --disable-warning=ExperimentalWarning src/host/cli.ts doctor"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
   }
 }

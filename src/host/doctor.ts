@@ -68,7 +68,7 @@ export async function runDoctor(root = SANDBOX_ROOT, port = 3400): Promise<{ ite
     const plugins = [...new Set(cfg.nodes.map((n) => n.plugin))];
     for (const p of plugins) {
       try {
-        const bin = providerOf(p).bin();
+        const bin = providerOf(String(p)).bin();
         add('ok', `provider ${p} → ${bin}`);
       } catch (e) {
         add('fail', `provider ${p} 不可用`, firstLine(e));
@@ -84,7 +84,7 @@ export async function runDoctor(root = SANDBOX_ROOT, port = 3400): Promise<{ ite
     }
 
     const roles = [...new Set(cfg.nodes.map((n) => n.role))];    for (const r of roles) {
-      if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(r)) {
+      if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(String(r))) {
         add('fail', `role「${r}」不合法`, '只能是字母数字下划线连字符；不修会退化成默认角色');
         continue;
       }
@@ -143,7 +143,7 @@ export async function runDoctor(root = SANDBOX_ROOT, port = 3400): Promise<{ ite
         const ml = await getModels({ refresh: true });
         if (ml.source === 'live') add('ok', `模型列表 ${ml.models.length} 个（实时）`);
         else add('warn', `模型列表来自${ml.source === 'cache' ? '缓存' : '内置兜底'}，未实时核实`, ml.error);
-        const bad = used.filter((m) => !modelKnown(ml, m));
+        const bad = used.filter((m) => !modelKnown(ml, String(m)));
         if (bad.length) {
           add(
             'fail',

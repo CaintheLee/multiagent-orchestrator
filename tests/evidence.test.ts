@@ -19,6 +19,7 @@ const node: NodeConfig = {
   access: 'write',
   role: 'executor',
   model: 'hy4free',
+  extraDirs: [],
 };
 const cfg: Config = { schema: 1, nodes: [node], root: node, maxSummary: 200, maxDetail: 4000 };
 

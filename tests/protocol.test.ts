@@ -20,6 +20,8 @@ const rootNode: NodeConfig = {
   timeoutMin: 5,
   access: 'write',
   role: 'executor',
+  model: '',
+  extraDirs: [],
 };
 
 const cfg: Config = {
@@ -86,7 +88,7 @@ test('产物在工作区内且真的存在，才算数', () => {
   const file = path.join(dir, 'out.html');
   fs.writeFileSync(file, '<h1>ok</h1>');
   const n: NodeConfig = { ...node, workspace: dir };
-  const { ok, bad } = checkArtifacts({ summary: 's', artifacts: [{ path: file, kind: 'html', bytes: 0 }], dispatch: [] }, n);
+  const { ok, bad } = checkArtifacts({ artifacts: [{ path: file, kind: 'html', bytes: 0 }] }, n);
   assert.equal(bad.length, 0);
   assert.equal(ok.length, 1);
   assert.equal(ok[0].bytes, 11);
@@ -97,7 +99,7 @@ test('产物在工作区外要拒绝（越界写文件的唯一防线）', () =>
   const outside = path.join(os.tmpdir(), 'ma-outside-' + Date.now() + '.txt');
   fs.writeFileSync(outside, 'x');
   const n: NodeConfig = { ...node, workspace: inside };
-  const { ok, bad } = checkArtifacts({ summary: 's', artifacts: [{ path: outside, kind: 'txt', bytes: 0 }], dispatch: [] }, n);
+  const { ok, bad } = checkArtifacts({ artifacts: [{ path: outside, kind: 'txt', bytes: 0 }] }, n);
   assert.equal(ok.length, 0);
   assert.equal(bad.length, 1);
   assert.match(bad[0], /不在工作区/);
@@ -108,7 +110,7 @@ test('产物文件不存在要拒绝', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ma-miss-'));
   const n: NodeConfig = { ...node, workspace: dir };
   const { ok, bad } = checkArtifacts(
-    { summary: 's', artifacts: [{ path: path.join(dir, 'nope.html'), kind: 'html', bytes: 0 }], dispatch: [] },
+    { artifacts: [{ path: path.join(dir, 'nope.html'), kind: 'html', bytes: 0 }] },
     n,
   );
   assert.equal(ok.length, 0);

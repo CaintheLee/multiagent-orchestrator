@@ -10,13 +10,54 @@
 
 import fs from 'node:fs';
 
-/** 交付清单段落里能认出的绝对路径 */
-const WIN_PATH = /[A-Za-z]:[\\/][^\s"'`，。；、）)|*?<>]*/g;
+/** 裸路径：不含空白与常见中文标点。带空格的路径要靠引号包裹才能认出来 */
+const BARE_PATH = /[A-Za-z]:[\\/][^\s"'`，。；、）)|*?<>]*/g;
+/** 引号/反引号包裹的路径：允许空格，覆盖「D:\My Docs\report.md」这种 */
+const QUOTED_PATH = /[`"']([A-Za-z]:[\\/][^`"']+)[`"']/g;
+/** 行首序号：`1.` `1)` `1、` `【1】` `-` `*` `·` */
+const BULLET = /^(?:[-*·]|【\d+】|\d+[.)、])\s*/;
 
-/** 段落的结束标志：下一个大标题、下一个粗体小标题、或空行 */
-function isSectionEnd(line: string): boolean {
+/**
+ * 段落是否到此结束。
+ *
+ * 空行**不算**结束：markdown 里清单项之间常夹空行，一遇空行就停会漏掉后半截
+ * （实测：六项清单中间空一行，只认出前两项，剩下四项永远不检查）。
+ */
+function isHardEnd(line: string): boolean {
   const s = line.trim();
-  return !s || s.startsWith('━━') || s.startsWith('#') || s.startsWith('【') || s.startsWith('##');
+  if (!s) return false;
+  // 大标题 / 粗体小标题 / 分隔线：这是下一个段落
+  if (s.startsWith('━━') || s.startsWith('#') || s.startsWith('---')) return true;
+  // 「【说明】」是段落标记，但「【1】」是列表序号——前者结束，后者继续
+  if (s.startsWith('【') && !/^【\d+】/.test(s)) return true;
+  return false;
+}
+
+/** 这一行像不像清单项：有路径，或者有序号/项目符号 */
+function looksLikeItem(line: string): boolean {
+  const s = line.trim();
+  if (!s) return false;
+  if (/[A-Za-z]:[\\/]/.test(s)) return true;
+  return BULLET.test(s);
+}
+
+/** 从一行里抠出路径。引号包裹的优先，再补裸路径（去重） */
+function pathsIn(line: string): string[] {
+  const body = line.trim().replace(BULLET, '');
+  const out: string[] = [];
+  for (const m of body.matchAll(QUOTED_PATH)) {
+    const p = m[1].trim().replace(/[.,;:!?]+$/, '');
+    if (p) out.push(p);
+  }
+  for (const m of body.match(BARE_PATH) ?? []) {
+    const p = m.replace(/[.,;:!?]+$/, '');
+    if (!p) continue;
+    // 引号路径被裸匹配又截了一次（`D:\My Docs\x.md` → `D:\My`）：
+    // 是已识别路径的前缀就丢掉，否则会多出一个永远不存在的「交付物」
+    if (out.some((q) => q.startsWith(p))) continue;
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
 }
 
 /**
@@ -33,11 +74,13 @@ export function listedDeliverables(task: string): string[] {
   const out: string[] = [];
   for (let i = start + 1; i < lines.length; i++) {
     const line = lines[i];
-    if (isSectionEnd(line)) break;
-    for (const m of line.match(WIN_PATH) ?? []) {
-      // 去掉行尾可能粘上的半角标点，路径本身不会以这些结尾
-      const p = m.replace(/[.,;:!?]+$/, '');
-      if (p && !out.includes(p)) out.push(p);
+    if (isHardEnd(line)) break;
+    if (!line.trim()) continue;
+    // 既不是路径也不是列表项：一段说明文字，清单到此为止。
+    // 不加这条会把后面正文里提到的其它路径也算成交付物，造成误判。
+    if (!looksLikeItem(line)) break;
+    for (const p of pathsIn(line)) {
+      if (!out.includes(p)) out.push(p);
     }
   }
   return out;

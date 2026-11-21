@@ -97,7 +97,13 @@ export async function applySpawns(
     let model = s.model && SAFE_MODEL.test(s.model) ? s.model : (st?.model || n.model);
     let role = s.role || st?.role || 'executor';
     let timeoutMin = st ? st.timeoutMin : n.timeoutMin;
-    let access: 'read' | 'write' = st ? st.access : n.access;
+    // access 只在 provider 支持只读时才有意义；配置里写错大小写或别的词时，
+    // 一律按 write 处理并留痕——静默降级成只读反而更危险（以为拦住了其实没拦）
+    const pickAccess = (v: unknown): 'read' | 'write' => (v === 'read' ? 'read' : 'write');
+    let access: 'read' | 'write' = pickAccess(st ? st.access : n.access);
+    if ((st ? st.access : n.access) !== access) {
+      log(`  派生 ${s.name}：access「${String(st ? st.access : n.access)}」不认识，按 write 处理`);
+    }
     let taskText = st?.taskPrefix ? st.taskPrefix + '\n\n' + s.task : s.task;
     // role 会被拼成 prompts/<role>.md 的路径：必须在这里挡住 "../x" 这类穿越，
     // 否则一条派生就能把 prompts 之外的 Markdown 读进后续所有提示词。
@@ -166,9 +172,11 @@ export async function applySpawns(
       const fin = getApproval(env.db, approvalId);
       if (fin?.payload){
         try {
-          const p = JSON.parse(fin.payload) as Record<string, unknown>;
-          if (typeof p.role === 'string' && SAFE_ROLE.test(p.role) && p.role !== role) role = p.role;
-          if (typeof p.model === 'string' && p.model && p.model !== model) model = p.model;
+          const p = JSON.parse(String(fin.payload)) as Record<string, unknown>;
+          const nextRole = typeof p.role === 'string' ? p.role : '';
+          const nextModel = typeof p.model === 'string' ? p.model : '';
+          if (SAFE_ROLE.test(nextRole) && nextRole !== role) role = nextRole;
+          if (nextModel && nextModel !== model) model = nextModel;
           if (typeof p.timeout_min === 'number' && Number.isFinite(p.timeout_min)){
             timeoutMin = Math.min(120, Math.max(1, Math.round(p.timeout_min)));
           }

@@ -18,7 +18,7 @@ const wrap = (json: string) => '正文\n\n```' + FENCE + '\n' + json + '\n```\n'
 
 const node: NodeConfig = {
   id: 'b', parent: 'a', name: '执行者', plugin: 'codebuddy', workspace: 'b',
-  timeoutMin: 5, access: 'write', role: 'executor', model: '',
+  timeoutMin: 5, access: 'write', role: 'executor', model: '', extraDirs: [],
 };
 const cfg: Config = { schema: 1, nodes: [node], root: node, maxSummary: 200, maxDetail: 4000 };
 

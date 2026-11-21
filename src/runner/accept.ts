@@ -3,7 +3,7 @@
 // 抽出来的理由：它们是收口流程里最该被反复打磨的文本（措辞直接影响模型判不判得准），
 // 放在 800 行的控制流里没人愿意改。这里只做字符串拼装，零副作用，可以单独比对。
 
-import type { Ask } from '../protocol/schema.ts';
+import type { Ask, Phase } from '../protocol/schema.ts';
 
 /** 正常收口：把下级交付整理给上级判断 */
 export function buildReviewBrief(origin: string, reports: string[], asks: Ask[] = []): string {

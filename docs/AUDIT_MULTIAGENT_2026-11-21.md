@@ -199,3 +199,42 @@ test('对话历史能读出来', () => {
 
 - R1 拿到令牌的人可以派活、起 CLI——这是产品功能本身，靠网络边界与令牌管理兜
 - 令牌走明文 HTTP：局域网内没上 TLS，敏感环境用 SSH 隧道或反代
+
+---
+
+## 十一、第二轮审计与开发（2026-11-21 夜）
+
+### 审计发现（3 条真缺陷）
+
+| # | 位置 | 问题 | 影响 | 状态 |
+|---|---|---|---|---|
+| A1 | `kernel/deliverables.ts` | 交付清单解析：①遇空行就结束段落 ②`【1】` 序号被当段尾 ③带空格路径被截断成 `D:/My` | ①漏检清单后半截 ②整段漏检 ③**误伤**：文件明明在盘上却判「不在」 | ✅ 已修 |
+| A2 | `host/server.ts` 提示词保存 | 临时文件名固定 `.tmp`，并发保存互相 rename | 后写的覆盖前写的 | ✅ 已修（pid+随机） |
+| A3 | `runner/spawn.ts` | `access` 从配置读出来是任意字符串，静默当 write 用 | 写 `READ`/`rw` 时不报错也不提示 | ✅ 已修（归一化 + 留痕） |
+
+A1 的三条边界都补了回归用例（`tests/deliverables.test.ts` 从 7 条增到 12 条）。
+
+### 排除的怀疑（验证后不成立）
+
+- **「收口判 pass 同时派活会丢活」**：`verdict` 的计算里已经写了 `dispatch.length ? 'rework' : 'pass'`，有派活必判 rework，阶段推进不会执行。加了用例锁住这个行为。
+- **「阶段推进 + spawn 冲突」**：`applySpawns` 在阶段推进**之前**执行，新线会真的落地；只是那一轮不会被派活（因为判了 pass）。概率低，记入观察。
+
+### 本轮开发（4 项）
+
+| # | 内容 | 验证 |
+|---|---|---|
+| D1 | `tsc --noEmit` 接入：`typescript@5.9` + `@types/node@22`，`tsconfig.json` 开 `strictNullChecks`/`erasableSyntaxOnly` | 源码 0 错误；注入未定义标识符 → TS2304；`npm run verify` 一条命令跑完 |
+| D2 | 阶段上限 8 → 10 | 回归用例 10 段跑完仍 `done`，收口恰好 10 次 |
+| D3 | `[limits]` 段 + `/api/limits` + 主控面板「运行上限」 | 越界 99 → 400（不静默夹取）；正常保存返回 `restartRequired` |
+| D4 | token / 时长熔断 | 超限停在轮次边界转 `blocked`，日志有「预算熔断」，0 = 不限不误伤 |
+
+### 类型检查的两个坑
+
+1. **`strict: false` 会关掉 `strictNullChecks`**，discriminated union 的收窄随之失效——一堆「property why does not exist」的假错误。开 `strictNullChecks` 后反而降到 51 条。
+2. **`as typeof final` 取的是当前流类型**（此时是 `null`），断言完变量变 `never`。用类型别名替代。
+
+### 语义决策
+
+- **`Config.spawn` / `Config.project` 改为可选**：老配置没有这两段，`loadConfig` 用 `DEFAULT_SPAWN` 兜底。
+- **`Artifact.kind` / `Receipt.spawn|tell|ask` 保持必填**：解析器一定产出，类型该反映事实。测试省字段就补测试，不放宽契约。
+- **`checkArtifacts` 参数收窄为 `Pick<Receipt, 'artifacts'>`**：它只读 artifacts，要求整份回执会让每个调用点凑冗余字段。

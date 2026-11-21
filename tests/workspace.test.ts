@@ -9,7 +9,7 @@ const ROOT = '<repo>';
 function mk(workspace: string): NodeConfig {
   return {
     id: 'b', parent: 'a', name: '执行者', plugin: 'codebuddy',
-    workspace, timeoutMin: 8, access: 'write', role: 'executor', model: 'hy4free',
+    workspace, timeoutMin: 8, access: 'write', role: 'executor', model: 'hy4free', extraDirs: [],
   };
 }
 

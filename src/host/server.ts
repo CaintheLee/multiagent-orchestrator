@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, nodeById, workspaceIsIsolated, MAX_NODES } from '../kernel/tree.ts';
+import { loadConfig, nodeById, workspaceIsIsolated, DEFAULT_SPAWN, DEFAULT_LIMITS, MAX_NODES } from '../kernel/tree.ts';
 import { loadRuns } from '../store/runs.ts';
 import { readLog, hasLog } from '../store/log.ts';
 import { openDB, importLegacyRuns, createTask, setTaskState } from '../store/db.ts';
@@ -203,13 +203,26 @@ await acquireSingleton(DB);
   if (mig.imported) console.log(`历史轮次导入 ${mig.imported} 条`);
 }
 const bus = new LogBus();
-// 全机共用一个车位池：任务级并发（MA_CONCURRENCY）和任务内的车道并发共用它，
-// 否则两层各 3 路叠起来就是 9 个 codebuddy 进程同时跑
-const POOL = new Semaphore(Number(process.env.MA_CONCURRENCY || 3));
+/**
+ * 车位上限：MA_CONCURRENCY > agents.toml 的 [limits].concurrency > 3。
+ *
+ * 环境变量留最高优先级：临时压到 1 做实验时不用改配置。
+ * 全机共用一个池——任务级并发和任务内的车道并发共用它，
+ * 否则两层各 3 路叠起来就是 9 个 CLI 进程同时跑。
+ *
+ * 注意：这里只在启动时读一次。改配置或环境变量都要重启才生效，
+ * 因为 Semaphore 的容量建好就固定了。
+ */
+const BOOT_CFG = (() => {
+  try { return loadConfig(CFG); } catch (e) { console.error('启动读配置失败：', String(e)); return null; }
+})();
+const CONCURRENCY = Math.max(1, Math.min(16,
+  Number(process.env.MA_CONCURRENCY || BOOT_CFG?.limits?.concurrency || 3) || 3));
+const POOL = new Semaphore(CONCURRENCY);
 const scheduler = new Scheduler({
   db: DB,
   root: SANDBOX_ROOT,
-  maxConcurrent: Number(process.env.MA_CONCURRENCY || 3),
+  maxConcurrent: CONCURRENCY,
   pool: POOL,
   onLog: (id, line) => bus.push(id, line),
   // 任务进终态后延迟释放日志缓冲：刚结束那几分钟界面可能还在看，
@@ -646,6 +659,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           usage?: unknown;
           stray?: Array<{ path?: string; bytes?: number; why?: string }>;
           ask?: Array<{ from?: string; to?: string; question?: string }>;
+          question?: string;
         }>(String(r.json_path));
         if (j) {
           summary = j.summary ?? '';
@@ -853,6 +867,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           access,
           role: String(body.role || id).trim(),
           model: String(body.model || cfg.root.model || '').trim(),
+          // 新建的节点默认没有白名单目录：不继承旧的，避免把上一任的授权带过去
+          extraDirs: [],
         };
         const oldRoot = cfg.root;
         oldRoot.parent = newRoot.id;
@@ -898,6 +914,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           // 新建代理默认给它自己一份提示词：role 用编号，文件是 prompts/<编号>.md
           role: String(body.role || id).trim(),
           model: String(body.model || '').trim(),
+          extraDirs: [],
         };
         cfg.nodes.push(n);
         return n;
@@ -982,7 +999,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const dir = PROMPTS_DIR;
       fs.mkdirSync(dir, { recursive: true });
       const f = path.join(dir, role + '.md');
-      const tmp = f + '.tmp';
+      // 临时名带 pid + 随机：两个窗口同时保存同一个角色时，固定 .tmp 会互相
+      // rename 掉对方的中间态，最后落盘的是谁的内容说不准（和 saveConfig 同一个坑）
+      const tmp = `${f}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
       fs.writeFileSync(tmp, text, 'utf8');
       fs.renameSync(tmp, f);
       json(res, 200, { ok: true, bytes: Buffer.byteLength(text, 'utf8') });
@@ -1167,11 +1186,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       model: node.model,
       // 对话是「人在问项目」，所以默认站在项目根，而不是空的任务工作区
       // 对话站的项目目录：优先环境变量，其次配置里的 project.root，最后才猜
-      cwd: process.env.MA_CHAT_CWD || cfg.project.root || path.join(path.dirname(CFG), '..', 'Game'),
+      cwd: process.env.MA_CHAT_CWD || cfg.project?.root || path.join(path.dirname(CFG), '..', 'Game'),
       plugin: node.plugin,
       taskSnapshot: chatTaskSnapshot(),
-      projectName: cfg.project.name,
-      projectRoot: cfg.project.root,
+      projectName: cfg.project?.name || '',
+      projectRoot: cfg.project?.root || '',
     });
     if (!r.ok) { json(res, 409, { error: r.error }); return; }
     json(res, 202, { ok: true });
@@ -1202,7 +1221,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     let cfg;
     try { cfg = loadConfig(CFG); } catch (e) { json(res, 500, { error: String(e) }); return; }
     if (req.method === 'GET') {
-      json(res, 200, { settings: cfg.spawn });
+      json(res, 200, { settings: cfg.spawn ?? DEFAULT_SPAWN });
       return;
     }
     if (req.method === 'POST') {
@@ -1246,6 +1265,54 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
   }
 
+  if (p === '/api/limits') {
+    let cfg;
+    try { cfg = loadConfig(CFG); } catch (e) { json(res, 500, { error: String(e) }); return; }
+    if (req.method === 'GET') {
+      const lim = cfg.limits ?? DEFAULT_LIMITS;
+      json(res, 200, {
+        limits: lim,
+        // 车位的实际值在启动时定死：改了配置要重启才生效，界面必须说清楚
+        effectiveConcurrency: CONCURRENCY,
+        restartRequired: lim.concurrency !== CONCURRENCY,
+      });
+      return;
+    }
+    if (req.method === 'POST') {
+      const body = await readJson(req);
+      const s = (body.limits || body) as Record<string, unknown>;
+      /**
+       * 越界直接拒，不静默夹取。
+       * 夹取看着"友好"，实际是把 99 悄悄变成 16 存进配置——人以为设成 99 了，
+       * 下次看到 16 只会觉得配置被谁改过。宁可报错让人重填。
+       */
+      const pick = (v: unknown, def: number, lo: number, hi: number): number | null => {
+        if (v === undefined || v === null || v === '') return def;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        const r = Math.round(n);
+        if (r < lo || r > hi) return null;
+        return r;
+      };
+      const concurrency = pick(s.concurrency, DEFAULT_LIMITS.concurrency, 1, 16);
+      const maxTokens = pick(s.maxTokens, 0, 0, 100_000_000);
+      const maxMinutes = pick(s.maxMinutes, 0, 0, 24 * 60);
+      if (concurrency === null) { json(res, 400, { error: 'concurrency 要是 1–16 的整数' }); return; }
+      if (maxTokens === null) { json(res, 400, { error: 'max_tokens 要是 0–100000000 的整数' }); return; }
+      if (maxMinutes === null) { json(res, 400, { error: 'max_minutes 要是 0–1440 的整数' }); return; }
+      const saved = await mutateConfig(CFG, (disk) => {
+        disk.limits = { concurrency, maxTokens, maxMinutes };
+        return disk.limits;
+      });
+      json(res, 200, {
+        ok: true,
+        limits: saved,
+        restartRequired: saved.concurrency !== CONCURRENCY,
+      });
+      return;
+    }
+  }
+
   if (p === '/api/roles') {
     // 职责模板清单：开线时从这里选，别让人手打一个不存在的名字
     json(res, 200, { roles: listRoles(url.searchParams.get('refresh') === '1') });
@@ -1282,7 +1349,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const patch = body.patch as Record<string, unknown> | undefined;
     if (decision === 'approve' && patch && typeof patch === 'object'){
       let cur: Record<string, unknown> = {};
-      try { cur = JSON.parse(row.payload || '{}') as Record<string, unknown>; } catch {}
+      try { cur = JSON.parse(String(row.payload ?? '{}')) as Record<string, unknown>; } catch {}
       const next: Record<string, unknown> = { ...cur };
       if (typeof patch.role === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(patch.role)) next.role = patch.role;
       if (typeof patch.model === 'string') next.model = patch.model.slice(0, 80);
@@ -1294,7 +1361,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           // 派生线继承提出者的 plugin：做不到只读就别让人在弹窗里选，
           // 否则要等到开线时才被拦，白填一遍表单
           let parentId = '';
-          try { parentId = String((JSON.parse(row.payload || '{}') as Record<string, unknown>).parent || ''); } catch {}
+          try { parentId = String((JSON.parse(String(row.payload ?? '{}')) as Record<string, unknown>).parent || ''); } catch {}
           let plugin = '';
           try { plugin = loadConfig(CFG).nodes.find((n) => n.id === parentId)?.plugin || ''; } catch {}
           if (!plugin || !supportsReadOnly(plugin)) {

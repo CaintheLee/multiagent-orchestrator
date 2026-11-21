@@ -14,6 +14,7 @@ import { reportText } from './report.ts';
 import { runLanes } from '../kernel/lane.ts';
 import { Semaphore } from '../kernel/pool.ts';
 import { loadContext, loadJournal, loadLessons } from '../kernel/memory.ts';
+import type { Limits } from '../kernel/tree.ts';
 import { saveCheckpoint } from '../store/checkpoints.ts';
 import { addMessage, takeMessages } from '../store/messages.ts';
 import { runAgent } from '../adapters/spawn.ts';
@@ -67,6 +68,8 @@ export type RunCtx = {
    * 测试注入一个假的，才能在不起真 CLI 的情况下跑通多层树、打回、派生这些分支。
    */
   runner?: typeof runAgent;
+  /** 运行上限（token / 时长）。不给就不限，命令行调试走这条 */
+  limits?: Limits;
 };
 
 export async function runTree(
@@ -83,6 +86,10 @@ export async function runTree(
   const node = nodes.find((n) => n.id === node0.id)!;
 
   let budget = MAX_ROUNDS;
+  /** 本次任务累计消耗的 token（所有节点、所有轮次） */
+  let spentTokens = 0;
+  /** 任务起跑时刻，用来算时长上限 */
+  const startedMs = Date.now();
   // 只有本次运行产生的记录才算「这次有没有空转」，历史打回不算
   const thisRun: RunRecord[] = [];
 
@@ -99,6 +106,27 @@ export async function runTree(
   const reviewRounds = new Map<string, number>();
   /** 每个节点名下的「下级在等我回答」。收口时据此判断它有没有把问题吞掉 */
   const pendingAsks = new Map<string, Ask[]>();
+
+  /**
+   * 预算闸门：超了返回原因，没超返回 null。
+   *
+   * 为什么放在轮次边界而不是中途杀进程：CLI 是一次性调用，中途杀会丢回执、
+   * 留下半截产物；在边界停下能保住已交付的东西，还能续跑。
+   */
+  function overBudget(): string | null {
+    const lim = ctx.limits;
+    if (!lim) return null;
+    if (lim.maxTokens > 0 && spentTokens >= lim.maxTokens) {
+      return `token 已用 ${spentTokens.toLocaleString('en-US')}，超过上限 ${lim.maxTokens.toLocaleString('en-US')}`;
+    }
+    if (lim.maxMinutes > 0) {
+      const min = (Date.now() - startedMs) / 60_000;
+      if (min >= lim.maxMinutes) {
+        return `已跑 ${Math.round(min)} 分钟，超过上限 ${lim.maxMinutes} 分钟`;
+      }
+    }
+    return null;
+  }
 
   function remember(nodeId: string, arts: Artifact[]): void {
     if (!arts.length) return;
@@ -419,7 +447,10 @@ export async function runTree(
     // 成本代理指标：真 token 拿不到，先记模型和输入规模，至少能看出哪条线在烧
     rec.model = n.model || '';
     rec.promptBytes = Buffer.byteLength(prompt, 'utf8');
-    if (result.usage) rec.usage = result.usage;
+    if (result.usage) {
+      rec.usage = result.usage;
+      spentTokens += result.usage.total || 0;
+    }
 
     if (rec.usage) {
       log(`${pad}  tokens  ${rec.usage.total.toLocaleString('en-US')}（入 ${rec.usage.input.toLocaleString('en-US')} / 出 ${rec.usage.output.toLocaleString('en-US')}，${rec.usage.steps} 次调用）`);
@@ -567,6 +598,12 @@ export async function runTree(
       log(`    收到取消，停在轮次边界`);
       return null;
     }
+    // 预算也是边界生效：停在这里能保住已交付的产物，人加预算后续跑即可
+    const over = overBudget();
+    if (over) {
+      log(`    预算熔断：${over}`);
+      return closeBlocked(n, parent, origin || t, `${over}。加预算后续跑，已交付的部分不会重做`);
+    }
     // 收口轮是流程必经：它既不该占预算，也不该被「预算/打回次数」拦住，
     // 否则最后一步永远拿不到结论。约束只作用在「往下一层派活」上。
     if (review) {
@@ -682,8 +719,8 @@ export async function runTree(
             // 阶段推进是计划内的活，不是空转：给它补一段预算，否则四段根本跑不完
             budget += 3;
             // 换段就是换一件事，收口计数必须清零。
-            // 不清的话：协议允许 8 段，而单节点收口上限是 6 次，
-            // 7–8 段的任务即使每段一次通过，也会在第 7 段前被 blocked（审计 M4）
+            // 不清的话：协议允许 10 段，而单节点收口上限是 6 次，
+            // 7 段以上的任务即使每段一次通过，也会在第 7 段前被 blocked（审计 M4）
             reviewRounds.set(n.id, 0);
             log(`  第 ${nth}/${st.plan.length} 段：${next.name}（上一段 ${curId} 已过，继续）`);
             return await step(n, buildPhaseBrief(st.plan, done, next), rec.id, false, origin || t, 0, []);

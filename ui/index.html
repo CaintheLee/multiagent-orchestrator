@@ -1005,6 +1005,22 @@
                 </div>
               </div>
             </details>
+            <!-- 运行上限：并发与预算。改了并发要重启才生效，界面会提示 -->
+            <details class="spawnset" id="limitSet">
+              <summary>运行上限<span class="sp-state" id="limState"></span></summary>
+              <div class="sp-body">
+                <div class="sp-grid">
+                  <label>并发车位<input id="limConc" type="number" min="1" max="16" value="3"><span class="sp-cnt">同时跑几个 CLI；改了要重启</span></label>
+                  <label>token 上限<input id="limTokens" type="number" min="0" step="100000" value="0"><span class="sp-cnt">单任务累计；0＝不限</span></label>
+                  <label>时长上限(分)<input id="limMinutes" type="number" min="0" max="1440" value="0"><span class="sp-cnt">从任务开始算；0＝不限</span></label>
+                </div>
+                <p class="sp-cnt" style="margin:4px 0 0">超限会停在轮次边界转「卡住」，已交付的产物保留，加预算后可续跑。</p>
+                <div class="sp-acts">
+                  <button type="button" class="sm" id="limSave">保存</button>
+                  <span class="muted xs" id="limHint"></span>
+                </div>
+              </div>
+            </details>
             <!-- 历史提交：点一条把原文放回上面的框，改两句再发，不用重写 -->
             <div class="hist">
               <div class="hist-h"><span>历史提交</span>
@@ -2121,6 +2137,7 @@ async function renderMasterUI(){
   void renderHistory();
   // 开线设置只在首次进面板时读一次：每轮重读会把正在编辑的输入框冲掉
   if (!spawnLoaded) void loadSpawnSettings();
+  if (!limitsLoaded) void loadLimits();
   const hb = $('#mHistory');
   if (hb && !hb.dataset.wired){
     hb.dataset.wired = '1';
@@ -2725,6 +2742,8 @@ async function loadRoles(){
 
 /** 开线设置：两个开关 + 默认参数，存 agents.toml 的 [spawn] */
 let spawnLoaded = false;
+/** 运行上限只在首次进面板时读一次，理由同 spawnLoaded */
+let limitsLoaded = false;
 function paintSpawnState(s){
   const el = $('#spawnSetState');
   if (!el) return;
@@ -2756,6 +2775,36 @@ async function loadSpawnSettings(){
     paintSpawnState(s);
     spawnLoaded = true;
   } catch {}
+}
+
+async function loadLimits(){
+  try {
+    const r = await fetch('/api/limits', { cache: 'no-store' }).then((x) => x.json());
+    const l = r.limits || {};
+    if ($('#limConc')) $('#limConc').value = l.concurrency ?? 3;
+    if ($('#limTokens')) $('#limTokens').value = l.maxTokens ?? 0;
+    if ($('#limMinutes')) $('#limMinutes').value = l.maxMinutes ?? 0;
+    paintLimitState(r);
+    limitsLoaded = true;
+  } catch {}
+}
+
+/** 摘要 + 「要重启」提示：并发是在启动时定死的，不符就必须说清楚 */
+function paintLimitState(r){
+  const el = $('#limState');
+  const hint = $('#limHint');
+  const l = (r && r.limits) || {};
+  const parts = [];
+  if (l.concurrency) parts.push('并发 ' + l.concurrency);
+  parts.push(l.maxTokens ? ('token ' + (l.maxTokens / 1e6).toFixed(1) + 'M') : 'token 不限');
+  parts.push(l.maxMinutes ? (l.maxMinutes + ' 分钟') : '时长不限');
+  if (el) el.textContent = parts.join(' · ');
+  if (hint && r && r.restartRequired){
+    hint.textContent = '并发改成 ' + l.concurrency + ' 后要重启 hub 才生效（当前 ' + r.effectiveConcurrency + '）';
+    hint.style.color = '#e6a03c';
+  } else if (hint){
+    hint.style.color = '';
+  }
 }
 
 /** 批准开线：先弹参数确认窗口 */
@@ -3201,6 +3250,26 @@ $('#spSave').onclick = async () => {
   paintSpawnState(r.settings || settings);
   if (hint) hint.textContent = '已保存';
   toast('开线设置已写入 agents.toml', 'ok');
+};
+
+$('#limSave').onclick = async () => {
+  const conc = Math.round(Number($('#limConc').value));
+  const tokens = Math.round(Number($('#limTokens').value));
+  const minutes = Math.round(Number($('#limMinutes').value));
+  if (!(conc >= 1 && conc <= 16)){ toast('并发要在 1–16 之间', 'err'); $('#limConc').focus(); return; }
+  if (!(tokens >= 0)){ toast('token 上限不能是负数', 'err'); $('#limTokens').focus(); return; }
+  if (!(minutes >= 0 && minutes <= 1440)){ toast('时长上限要在 0–1440 分钟', 'err'); $('#limMinutes').focus(); return; }
+  const hint = $('#limHint');
+  if (hint) hint.textContent = '保存中…';
+  const r = await postJson('/api/limits', { limits: { concurrency: conc, maxTokens: tokens, maxMinutes: minutes } });
+  if (!r.ok){
+    if (hint) hint.textContent = '';
+    toast('保存失败：' + r.error, 'err');
+    return;
+  }
+  paintLimitState(r);
+  if (hint && !r.restartRequired) hint.textContent = '已保存，下一次任务生效';
+  toast(r.restartRequired ? '已写入，重启 hub 后并发才生效' : '运行上限已写入 agents.toml', r.restartRequired ? 'warn' : 'ok');
 };
 
 $('#inspector').addEventListener('input', (e) => {

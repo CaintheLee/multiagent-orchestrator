@@ -175,6 +175,8 @@ export class Scheduler {
         root: this.opts.root,
         signal: ac.signal,
         pool: this.opts.pool,
+        // 配置里的运行上限：0 表示不限，交给引擎在轮次边界自己判
+        limits: cfg.limits,
       });
 
       // 取消可能停在两轮之间（那时 rec 是 null），要认 signal 而不是 null

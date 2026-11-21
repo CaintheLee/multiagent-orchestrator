@@ -191,7 +191,9 @@ export function scanRecent(
  * 一轮跑完等于没留下可复用的东西（#40 的教训）。
  */
 export function checkArtifacts(
-  receipt: Receipt,
+  // 只声明它真正读的字段：这个函数不关心 evidence/spawn/tell，
+  // 收成 Receipt 会让每个调用点（尤其测试）不得不凑一份完整回执
+  receipt: Pick<Receipt, 'artifacts'>,
   node: NodeConfig,
   opts: { extraDirs?: string[]; refDirs?: string[] } = {},
 ): {

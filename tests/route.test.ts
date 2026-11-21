@@ -9,7 +9,7 @@ import type { RunRecord } from '../src/store/runs.ts';
 
 const kid = (id: string): NodeConfig => ({
   id, parent: 'a', name: id, plugin: 'codebuddy', workspace: id,
-  timeoutMin: 5, access: 'write', role: 'executor', model: '',
+  timeoutMin: 5, access: 'write', role: 'executor', model: '', extraDirs: [],
 });
 
 const kids = [kid('b'), kid('c')];

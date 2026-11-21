@@ -11,7 +11,7 @@ import type { Receipt } from '../src/protocol/schema.ts';
 function mkNode(workspace: string): NodeConfig {
   return {
     id: 'b', parent: 'a', name: '执行者', plugin: 'codebuddy',
-    workspace, timeoutMin: 8, access: 'write', role: 'executor', model: 'hy4free',
+    workspace, timeoutMin: 8, access: 'write', role: 'executor', model: 'hy4free', extraDirs: [],
   };
 }
 
@@ -26,6 +26,9 @@ function receipt(paths: string[]): Receipt {
     artifacts: paths.map((p) => ({ path: p, kind: 'txt', bytes: 0 })),
     dispatch: [],
     evidence: [],
+    spawn: [],
+    tell: [],
+    ask: [],
   };
 }
 

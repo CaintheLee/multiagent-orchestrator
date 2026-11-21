@@ -24,7 +24,7 @@ test('快照写入后能读回来', () => {
     node: 'b',
     state: 'done',
     summary: '写好了',
-    artifacts: [{ path: '/x/a.txt', bytes: 10 }],
+    artifacts: [{ path: '/x/a.txt', kind: 'txt', bytes: 10 }],
   });
   const cp = listCheckpoints(DB, taskId).find((c) => c.nodeId === 'b');
   assert.ok(cp);
@@ -54,7 +54,7 @@ test('同一个路径只保留一份，不会越滚越长', () => {
     state: 'done',
     verdict: 'pass',
     summary: '又改了一版',
-    artifacts: [{ path: '/x/a.txt', bytes: 99 }],
+    artifacts: [{ path: '/x/a.txt', kind: 'txt', bytes: 99 }],
   });
   const cp = listCheckpoints(DB, taskId).find((c) => c.nodeId === 'b');
   assert.equal(cp?.artifacts.length, 1);
@@ -127,7 +127,7 @@ test('stray 不累计：下一轮成功时清掉，避免旧失败一直挂着',
     node: 'a',
     state: 'done',
     summary: '这次走对了',
-    artifacts: [{ path: '/x/b.md', bytes: 5 }],
+    artifacts: [{ path: '/x/b.md', kind: 'md', bytes: 5 }],
     stray: [],
   });
   const cp = listCheckpoints(DB, taskId).find((c) => c.nodeId === 'a');

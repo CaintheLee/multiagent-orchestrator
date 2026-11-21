@@ -50,16 +50,38 @@ export type ProjectInfo = {
   root: string;
 };
 
+/**
+ * 运行上限：不是「能不能做」，而是「最多花多少」。
+ *
+ * 之前只有轮次预算（每段 +3），它能防「原地打转」，防不了「一轮烧掉几十万 token」。
+ * 这里给三个可配的闸门，0 表示不限。
+ */
+export type Limits = {
+  /** 全机车位：同时跑几个 CLI 进程。和任务内车道共用同一个池 */
+  concurrency: number;
+  /** 单任务 token 上限；超了就停在轮次边界，任务转 blocked 等人决定 */
+  maxTokens: number;
+  /** 单任务时长上限（分钟），从任务开始算；0 = 不限 */
+  maxMinutes: number;
+};
+
+export const DEFAULT_LIMITS: Limits = { concurrency: 3, maxTokens: 0, maxMinutes: 0 };
+
 export type Config = {
   schema: number;
   nodes: NodeConfig[];
   root: NodeConfig;
   maxSummary: number;
   maxDetail: number;
-  /** 开线（派生）的审批策略与默认参数 */
-  spawn: SpawnSettings;
-  /** 这个实例服务的是哪个项目 */
-  project: ProjectInfo;
+  /**
+   * 开线（派生）的审批策略与默认参数。
+   * 可选：老配置文件没有 [spawn] 段，读出来就是 undefined，用 DEFAULT_SPAWN 兜底。
+   */
+  spawn?: SpawnSettings;
+  /** 这个实例服务的是哪个项目。可选，理由同 spawn */
+  project?: ProjectInfo;
+  /** 运行上限。可选：老配置没有 [limits] 段，用 DEFAULT_LIMITS */
+  limits?: Limits;
 };
 
 /**
@@ -228,6 +250,13 @@ export function loadConfig(file: string): Config {
     throw new Error(`这些节点从根 ${root.id} 走不到（parent 成环或指错）：${orphans.join('、')}`);
   }
 
+  const lim = raw.limits;
+  const limitInt = (key: string, def: number, lo: number, hi: number): number => {
+    const v = Number(lim?.[key]);
+    if (!Number.isFinite(v)) return def;
+    return Math.min(hi, Math.max(lo, Math.round(v)));
+  };
+
   const sp = raw.spawn;
   const flag = (key: string): boolean => {
     const v = sp?.[key];
@@ -243,6 +272,12 @@ export function loadConfig(file: string): Config {
     },
     maxSummary: num(raw.protocol, 'max_summary', 200),
     maxDetail: num(raw.protocol, 'max_detail', 4000),
+    limits: {
+      // 车位上限压到 16：再多就是本机 CPU 和模型限流先撑不住
+      concurrency: limitInt('concurrency', DEFAULT_LIMITS.concurrency, 1, 16),
+      maxTokens: limitInt('max_tokens', 0, 0, 100_000_000),
+      maxMinutes: limitInt('max_minutes', 0, 0, 24 * 60),
+    },
     spawn: {
       autoApprove: flag('auto_approve'),
       defaultsEnabled: flag('defaults_enabled'),
@@ -268,6 +303,13 @@ export function saveConfig(cfg: Config, file: string): void {
   out.push('[project]\n');
   out.push(line('name', cfg.project?.name));
   out.push(line('root', cfg.project?.root));
+  out.push('\n');
+  // 运行上限
+  const lim = cfg.limits ?? DEFAULT_LIMITS;
+  out.push('[limits]\n');
+  out.push(`concurrency = ${lim.concurrency}\n`);
+  out.push(`max_tokens = ${lim.maxTokens}\n`);
+  out.push(`max_minutes = ${lim.maxMinutes}\n`);
   out.push('\n');
   // 开线策略：两个开关写死成 true/false（不用 1/0），手改配置时一眼能看懂
   const sp = cfg.spawn ?? DEFAULT_SPAWN;
